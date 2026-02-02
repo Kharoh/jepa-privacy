@@ -153,6 +153,7 @@ class ViTLeJEPAEncoder(nn.Module):
     def __init__(self, proj_dim: int, img_size: int,
                  in_chans: int = 1,
                  backbone_name: str = "vit_tiny_patch16_224",
+                 patch_size: int = 4,
                  drop_path_rate: float = 0.1):
         super().__init__()
         self.backbone = timm.create_model(
@@ -162,6 +163,7 @@ class ViTLeJEPAEncoder(nn.Module):
             drop_path_rate=drop_path_rate,
             img_size=img_size,
             in_chans=in_chans,
+            patch_size=patch_size,  # override patch size
         )
         emb_dim = self.backbone.num_features
         self.proj = MLP(emb_dim, [emb_dim * 4, emb_dim * 4, proj_dim], norm_layer=nn.BatchNorm1d)
@@ -430,6 +432,7 @@ class MAEViT(nn.Module):
     """ViT-based MAE for MNIST-sized images."""
     def __init__(self, img_size: int = 32, mask_ratio: float = 0.4,
                  in_chans: int = 1, backbone_name: str = "vit_tiny_patch16_224",
+                 patch_size: int = 4,
                  drop_path_rate: float = 0.1):
         super().__init__()
         self.encoder = timm.create_model(
@@ -439,6 +442,7 @@ class MAEViT(nn.Module):
             drop_path_rate=drop_path_rate,
             img_size=img_size,
             in_chans=in_chans,
+            patch_size=patch_size,  # override patch size
         )
         self.mask_ratio = mask_ratio
         patch_size = self.encoder.patch_embed.patch_size
@@ -1567,8 +1571,8 @@ def run_federated_privacy_experiment():
     SAMPLES_PER_CLIENT = 10000
     TOTAL_SAMPLES = NUM_CLIENTS * SAMPLES_PER_CLIENT
     DIRICHLET_ALPHA = 0.7
-    NUM_ROUNDS = 10000
-    NUM_VIEWS = 2
+    NUM_ROUNDS = 1000
+    NUM_VIEWS = 4
     LAMB = 0.005  # LeJEPA: balance between SIGReg and invariance
     USE_CNN = False
     USE_VIT = True
@@ -1664,6 +1668,7 @@ def run_federated_privacy_experiment():
             img_size=IMAGE_SHAPE[1],
             mask_ratio=0.4,
             in_chans=IMAGE_SHAPE[0],
+            patch_size=4,  # 64 patches for 32x32 images
         )
     else:
         mae_model = MAEModel(

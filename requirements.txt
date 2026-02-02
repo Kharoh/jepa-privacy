@@ -2,4 +2,6 @@ torch
 torchvision
 matplotlib
 numpy
-scikit-learn
+timm
+datasets
+huggingface-hub

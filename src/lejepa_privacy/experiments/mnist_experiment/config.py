@@ -47,6 +47,9 @@ class ExperimentConfig:
     max_batches_per_epoch: int | None = None
     optimizer: str = "sgd"
     learning_rate: float = 1e-3
+    data_loader_num_workers: int = 0
+    data_loader_pin_memory: bool = True
+    global_batch_size: int = 256
 
     normalize_mean: float = 0.1307
     normalize_std: float = 0.3081
@@ -94,10 +97,16 @@ class ExperimentConfig:
     attack_loss_strategies: List[str] = field(default_factory=lambda: ["cosine", "mse"])
     attack_eval_clients: int = 1
     attack_eval_batches: int = 1
+    attack_iterations: int = 200
+    attack_plot_iterations: int = 200
     attack_success_mse_threshold: float = 0.05
     attack_use_raw_data: bool = True
     attack_deterministic_augment: bool = True
     attack_seed: int = 123
+
+    val_tsne_samples: int = 600
+    probe_train_samples: int = 2000
+    probe_test_samples: int = 1000
 
     output_dir: str = "results"
     checkpoint_every: int = 250

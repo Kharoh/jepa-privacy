@@ -339,6 +339,8 @@ class FederatedClient:
         batch_size: int,
         max_batches: int | None,
         optimizer_name: str = "sgd",
+        num_workers: int = 0,
+        pin_memory: bool = False,
     ) -> Dict:
         """
         Train locally and return gradients for privacy analysis.
@@ -359,7 +361,13 @@ class FederatedClient:
             dataset = TensorDataset(self.data, self.labels)
         else:
             dataset = TensorDataset(self.data)
-        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        loader = DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
 
         last_batch = None
         last_labels = None
@@ -606,6 +614,7 @@ def load_checkpoint(
 
 def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path, logger) -> Dict[str, Dict[str, List[float]]]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pin_memory = bool(config.data_loader_pin_memory and device.type == "cuda")
 
     total_samples = config.num_clients * config.samples_per_client
     mnist_transform = create_mnist_transform(config.image_shape)
@@ -782,6 +791,12 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
     attack_class_log_path = output_dir / "attack_per_class_metrics.csv"
     initialize_attack_class_log(attack_class_log_path)
 
+    val_dataset = None
+    test_dataset = None
+    if config.plot_rounds:
+        val_dataset = datasets.MNIST(root="data", train=False, download=True, transform=mnist_transform)
+        test_dataset = datasets.MNIST(root="data", train=False, download=True, transform=mnist_transform)
+
     start_round = 0
     if config.resume_from:
         checkpoint_file = Path(config.resume_from)
@@ -804,6 +819,8 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 batch_size=config.batch_size,
                 max_batches=config.max_batches_per_epoch,
                 optimizer_name=config.optimizer,
+                num_workers=config.data_loader_num_workers,
+                pin_memory=pin_memory,
             )
             for client in lejepa_clients
         ]
@@ -841,6 +858,8 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 batch_size=config.batch_size,
                 max_batches=config.max_batches_per_epoch,
                 optimizer_name=config.optimizer,
+                num_workers=config.data_loader_num_workers,
+                pin_memory=pin_memory,
             )
             for client in mae_clients
         ]
@@ -867,7 +886,11 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         results["system"]["time_sec"].append(float(round_time))
         results["system"]["rounds"].append(round_idx)
 
-        global_batch = sample_tensor_batch(all_train_data, max_samples=256, seed=round_idx + 1)
+        global_batch = sample_tensor_batch(
+            all_train_data,
+            max_samples=config.global_batch_size,
+            seed=round_idx + 1,
+        )
         lejepa_global_losses = compute_loss_components(
             lejepa_server.global_model,
             global_batch,
@@ -983,7 +1006,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                                     attack_input,
                                     true_signal,
                                     lr=0.05,
-                                    iterations=600,
+                                    iterations=config.attack_iterations,
                                     loss_strategy=strategy,
                                 )
                             else:
@@ -991,7 +1014,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                                     attack_input,
                                     true_signal,
                                     lr=0.05,
-                                    iterations=600,
+                                    iterations=config.attack_iterations,
                                     loss_strategy=strategy,
                                     update_lr=config.learning_rate,
                                 )
@@ -1132,6 +1155,10 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
 
         if config.plot_rounds and round_idx in config.plot_rounds:
             logger.info("[Plotting] Reconstruction steps at round %s", round_idx + 1)
+            plot_iterations = min(max(config.plot_steps), config.attack_plot_iterations)
+            plot_steps = [step for step in config.plot_steps if step <= plot_iterations]
+            if not plot_steps:
+                plot_steps = [plot_iterations]
             class_samples = sample_class_images(
                 all_train_data,
                 all_train_labels,
@@ -1172,32 +1199,32 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                     lejepa_recon, lejepa_history = lejepa_attacker.attack(
                         samples,
                         lejepa_signal,
-                        iterations=max(config.plot_steps),
+                        iterations=plot_iterations,
                         return_history=True,
-                        record_steps=config.plot_steps,
+                        record_steps=plot_steps,
                     )
                     mae_recon, mae_history = mae_attacker.attack(
                         samples,
                         mae_signal,
-                        iterations=max(config.plot_steps),
+                        iterations=plot_iterations,
                         return_history=True,
-                        record_steps=config.plot_steps,
+                        record_steps=plot_steps,
                     )
                 else:
                     lejepa_recon, lejepa_history = lejepa_attacker.attack(
                         samples,
                         lejepa_signal,
-                        iterations=max(config.plot_steps),
+                        iterations=plot_iterations,
                         return_history=True,
-                        record_steps=config.plot_steps,
+                        record_steps=plot_steps,
                         update_lr=config.learning_rate,
                     )
                     mae_recon, mae_history = mae_attacker.attack(
                         samples,
                         mae_signal,
-                        iterations=max(config.plot_steps),
+                        iterations=plot_iterations,
                         return_history=True,
-                        record_steps=config.plot_steps,
+                        record_steps=plot_steps,
                         update_lr=config.learning_rate,
                     )
 
@@ -1209,7 +1236,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             plot_reconstruction_steps_by_class(
                 originals_by_class=originals["lejepa"],
                 histories_by_class=histories["lejepa"],
-                steps=config.plot_steps,
+                steps=plot_steps,
                 save_path=str(output_dir / f"lejepa_recon_steps_round{round_idx + 1}.png"),
                 title=f"LeJEPA Recon Steps (Round {round_idx + 1})",
                 image_shape=config.image_shape,
@@ -1220,7 +1247,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             plot_reconstruction_steps_by_class(
                 originals_by_class=originals["mae"],
                 histories_by_class=histories["mae"],
-                steps=config.plot_steps,
+                steps=plot_steps,
                 save_path=str(output_dir / f"mae_recon_steps_round{round_idx + 1}.png"),
                 title=f"MAE Recon Steps (Round {round_idx + 1})",
                 image_shape=config.image_shape,
@@ -1230,8 +1257,13 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             )
 
             logger.info("[Plotting] t-SNE embeddings for validation samples")
-            val_dataset = datasets.MNIST(root="data", train=False, download=True, transform=mnist_transform)
-            val_data, val_labels = sample_mnist_dataset(val_dataset, max_samples=600)
+            if val_dataset is None:
+                val_dataset = datasets.MNIST(
+                    root="data", train=False, download=True, transform=mnist_transform
+                )
+            val_data, val_labels = sample_mnist_dataset(
+                val_dataset, max_samples=config.val_tsne_samples
+            )
             val_data_norm = normalize_mnist(val_data, config.normalize_mean, config.normalize_std)
             plot_tsne_for_validation(
                 lejepa_server.global_model,
@@ -1255,11 +1287,18 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         if config.plot_rounds and round_idx in config.plot_rounds:
             logger.info("[Probing] Linear probe at round %s", round_idx + 1)
             train_data, train_labels = sample_tensor_dataset(
-                all_train_data, all_train_labels, max_samples=2000
+                all_train_data,
+                all_train_labels,
+                max_samples=config.probe_train_samples,
             )
 
-            test_dataset = datasets.MNIST(root="data", train=False, download=True, transform=mnist_transform)
-            test_data, test_labels = sample_mnist_dataset(test_dataset, max_samples=1000)
+            if test_dataset is None:
+                test_dataset = datasets.MNIST(
+                    root="data", train=False, download=True, transform=mnist_transform
+                )
+            test_data, test_labels = sample_mnist_dataset(
+                test_dataset, max_samples=config.probe_test_samples
+            )
 
             train_data_norm = normalize_mnist(train_data, config.normalize_mean, config.normalize_std)
             test_data_norm = normalize_mnist(test_data, config.normalize_mean, config.normalize_std)

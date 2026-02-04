@@ -423,7 +423,7 @@ class FederatedClient:
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.GradScaler(enabled=use_amp and device.type == "cuda"):
+                with torch.amp.autocast(enabled=use_amp and device.type == "cuda"):
                     if self.model_type == "lejepa":
                         if self.augmenter is None:
                             raise ValueError("augmenter is required for LeJEPA training")

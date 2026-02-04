@@ -65,8 +65,11 @@ class ViewAugmenter:
             [v2.RandomPerspective(distortion_scale=0.3, p=1.0)],
             p=kwargs.get("perspective_prob", 0.0),
         )
+        solarize_threshold = kwargs.get("solarize_threshold", 128)
+        if isinstance(solarize_threshold, (int, float)) and solarize_threshold > 1.0:
+            solarize_threshold = solarize_threshold / 255.0
         self.solarize = v2.RandomApply(
-            [v2.RandomSolarize(threshold=kwargs.get("solarize_threshold", 128))],
+            [v2.RandomSolarize(threshold=solarize_threshold)],
             p=kwargs.get("solarize_prob", 0.0),
         )
 

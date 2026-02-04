@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .data import normalize_mnist
 from .models import LeJEPAModel, MAEModel, MAEViT
 
 
@@ -373,17 +374,27 @@ class UpdateInversionAttack:
         input_dim: int,
         num_views: int = 2,
         view_augmenter: Callable[[torch.Tensor], torch.Tensor] | None = None,
+        normalize_mean: float | None = None,
+        normalize_std: float | None = None,
     ):
         self.model = model
         self.input_dim = input_dim
         self.num_views = num_views
         self.view_augmenter = view_augmenter
+        self.normalize_mean = normalize_mean
+        self.normalize_std = normalize_std
 
     def _prepare_views(self, dummy: torch.Tensor, model: nn.Module) -> torch.Tensor:
+        def _normalize(x: torch.Tensor) -> torch.Tensor:
+            if self.normalize_mean is None or self.normalize_std is None:
+                return x
+            return normalize_mnist(x, self.normalize_mean, self.normalize_std)
+
         if isinstance(model, LeJEPAModel):
             if dummy.dim() == 2:
                 if self.view_augmenter is None:
-                    raise ValueError("view_augmenter required for LeJEPA update inversion")
+                    normalized = _normalize(dummy.clone())
+                    return normalized.unsqueeze(1).repeat(1, self.num_views, 1)
                 return self.view_augmenter(dummy.clone())
             return dummy
         if dummy.dim() == 3:
@@ -393,7 +404,7 @@ class UpdateInversionAttack:
             if aug.dim() == 3:
                 return aug[:, 0, :]
             return aug
-        return dummy
+        return _normalize(dummy.clone())
 
     def _compute_update_vector(self, dummy: torch.Tensor, lr: float) -> torch.Tensor:
         model_copy = copy.deepcopy(self.model)

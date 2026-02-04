@@ -761,13 +761,17 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             lejepa_model,
             config.input_dim,
             config.num_views,
-            view_augmenter=attack_augmenter,
+            view_augmenter=None,
+            normalize_mean=config.normalize_mean,
+            normalize_std=config.normalize_std,
         )
         mae_attacker = UpdateInversionAttack(
             mae_model,
             config.input_dim,
             1,
-            view_augmenter=attack_mae_augmenter,
+            view_augmenter=None,
+            normalize_mean=config.normalize_mean,
+            normalize_std=config.normalize_std,
         )
     metrics_helper = GradientInversionAttack(lejepa_model, config.input_dim, config.num_views)
 

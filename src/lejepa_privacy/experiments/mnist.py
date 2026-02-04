@@ -1,13 +1,4 @@
-"""
-Federated Learning Privacy Comparison: LeJEPA vs MAE (MNIST).
-
-This module implements:
-1. LeJEPA with invariance loss + SIGReg
-2. Masked Autoencoder (MAE) baseline
-3. Federated learning with gradient averaging
-4. Mutual information I(X; G) computation
-5. Gradient inversion attacks for privacy quantification
-"""
+"""Legacy entrypoint for the MNIST federated privacy experiment."""
 
 from __future__ import annotations
 
@@ -2232,8 +2223,11 @@ def run_federated_privacy_experiment() -> Dict[str, Dict[str, List[float]]]:
     return results
 
 
-def run() -> Dict[str, Dict[str, List[float]]]:
-    return run_federated_privacy_experiment()
+from .mnist_experiment import run as _run
+
+
+def run() -> None:
+    _run()
 
 
 if __name__ == "__main__":

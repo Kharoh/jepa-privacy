@@ -64,5 +64,30 @@ def resolve_device(device: str) -> torch.device:
     return torch.device(device)
 
 
+def disable_cuda_sdp_kernels() -> None:
+    """Disable CUDA scaled dot-product attention kernels without backward support."""
+    if not torch.cuda.is_available():
+        return
+    backend = torch.backends.cuda
+    if hasattr(backend, "sdp_kernel"):
+        backend.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False)
+    for attr in (
+        "sdp_enabled",
+        "flash_sdp_enabled",
+        "scaled_dot_product_efficient_attention_enabled",
+        "enable_flash_sdp",
+        "enable_mem_efficient_sdp",
+        "enable_math_sdp",
+    ):
+        if hasattr(backend, attr):
+            try:
+                if "math" in attr:
+                    getattr(backend, attr)(True)
+                else:
+                    getattr(backend, attr)(False)
+            except TypeError:
+                setattr(backend, attr, False)
+
+
 def checkpoint_path(output_dir: Path, round_idx: int) -> Path:
     return output_dir / f"checkpoint_round_{round_idx:06d}.pt"

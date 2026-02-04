@@ -10,7 +10,7 @@ import numpy as np
 
 from .config import ExperimentConfig, load_config
 from .training import run_federated_privacy_experiment
-from .utils import ensure_dir, resolve_device, set_seed, setup_logging
+from .utils import disable_cuda_sdp_kernels, ensure_dir, resolve_device, set_seed, setup_logging
 
 
 def _build_output_dir(base_dir: str) -> Path:
@@ -39,6 +39,8 @@ def run() -> None:
 
     device = resolve_device(config.device)
     config.device = str(device)
+
+    disable_cuda_sdp_kernels()
 
     set_seed(config.seed, deterministic=config.deterministic)
 

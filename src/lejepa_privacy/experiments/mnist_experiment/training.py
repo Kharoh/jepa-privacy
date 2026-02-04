@@ -396,7 +396,7 @@ class FederatedClient:
         loader = self._get_loader(batch_size, num_workers, pin_memory)
         max_batches_effective = len(loader) if max_batches is None else min(max_batches, len(loader))
         last_batch_idx = max_batches_effective - 1
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type == "cuda")
+        scaler = torch.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
         last_batch = None
         last_labels = None
@@ -423,7 +423,7 @@ class FederatedClient:
 
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
+                with torch.amp.GradScaler(enabled=use_amp and device.type == "cuda"):
                     if self.model_type == "lejepa":
                         if self.augmenter is None:
                             raise ValueError("augmenter is required for LeJEPA training")

@@ -20,7 +20,7 @@ def _build_output_dir(base_dir: str) -> Path:
 
 def run() -> None:
     parser = argparse.ArgumentParser(description="MNIST federated privacy experiment")
-    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file")
+    parser.add_argument("--config", type=str, default="configs/mnist.json", help="Path to JSON config file")
     parser.add_argument("--output-dir", type=str, default=None, help="Override output directory")
     parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume")
     args = parser.parse_args()

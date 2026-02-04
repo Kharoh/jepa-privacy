@@ -142,13 +142,19 @@ def sample_class_images(
     labels: torch.Tensor,
     classes: List[int],
     samples_per_class: int = 4,
+    seed: int = 42,
 ) -> Dict[int, torch.Tensor]:
     """Return a dict mapping class -> samples (N, 784)."""
+    rng = np.random.default_rng(seed)
     class_samples = {}
     for cls in classes:
         indices = (labels == cls).nonzero(as_tuple=True)[0]
         if len(indices) == 0:
             continue
-        selected = indices[:samples_per_class]
-        class_samples[int(cls)] = data[selected]
+        if len(indices) > samples_per_class:
+            chosen = rng.choice(indices.numpy(), size=samples_per_class, replace=False)
+            selected = torch.as_tensor(chosen, dtype=indices.dtype)
+        else:
+            selected = indices
+        class_samples[int(cls)] = data[selected].clone()
     return class_samples

@@ -1077,9 +1077,10 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 all_train_labels,
                 config.plot_classes,
                 samples_per_class=1,
+                seed=config.seed + round_idx,
             )
             for cls, samples in class_samples.items():
-                plot_samples = samples
+                plot_samples = samples.clone()
                 for model_key, model, attacker, augmenter in (
                     ("lejepa", lejepa_server.global_model, lejepa_attacker, lejepa_augmenter),
                     ("mae", mae_server.global_model, mae_attacker, mae_augmenter),
@@ -1136,12 +1137,14 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 all_train_labels,
                 config.plot_classes,
                 samples_per_class=4,
+                seed=config.seed + round_idx,
             )
 
             histories = {"lejepa": {}, "mae": {}}
             originals = {"lejepa": {}, "mae": {}}
 
             for cls, samples in class_samples.items():
+                plot_samples = samples.clone()
                 if config.attack_on == "gradients":
                     lejepa_signal = compute_gradients_for_data(
                         lejepa_server.global_model,
@@ -1201,7 +1204,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 histories["lejepa"][cls] = lejepa_history
                 histories["mae"][cls] = mae_history
                 originals["lejepa"][cls] = plot_samples
-                originals["mae"][cls] = plot_samples
+                originals["mae"][cls] = plot_samples.clone()
 
             plot_reconstruction_steps_by_class(
                 originals_by_class=originals["lejepa"],

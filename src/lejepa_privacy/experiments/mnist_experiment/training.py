@@ -464,6 +464,8 @@ def _build_results_dict() -> Dict[str, Dict[str, List[float]]]:
 
 def _compute_baseline_metrics(original: torch.Tensor, data_range: float = 1.0) -> Tuple[Dict[str, float], Dict[str, float]]:
     rng = np.random.default_rng(42)
+    if original.dim() > 2:
+        original = original.view(original.shape[0], -1)
     random_recon = torch.tensor(rng.random(original.shape), dtype=original.dtype)
     mean_img = original.mean(dim=0, keepdim=True)
     mean_recon = mean_img.repeat(original.shape[0], 1)

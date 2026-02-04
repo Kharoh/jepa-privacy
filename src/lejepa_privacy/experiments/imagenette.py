@@ -8,12 +8,6 @@ This script trains:
 It compares training losses and online linear probe accuracy.
 """
 
-from pathlib import Path
-import sys
-
-_ROOT = Path(__file__).resolve().parent
-sys.path.append(str(_ROOT / "src"))
-
 from __future__ import annotations
 
 import argparse
@@ -24,6 +18,7 @@ from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,7 +27,6 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
 from torchvision.ops import MLP
 from torchvision.transforms import v2
-import timm
 
 IMAGENETTE_MEAN = [0.485, 0.456, 0.406]
 IMAGENETTE_STD = [0.229, 0.224, 0.225]
@@ -78,7 +72,6 @@ def _disable_cuda_sdp_kernels() -> None:
     if not torch.cuda.is_available():
         return
     backend = torch.backends.cuda
-    # Prefer math-only SDP kernels to avoid missing backward implementations.
     if hasattr(backend, "sdp_kernel"):
         backend.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False)
     for attr in (
@@ -96,7 +89,6 @@ def _disable_cuda_sdp_kernels() -> None:
                 else:
                     getattr(backend, attr)(False)
             except TypeError:
-                # Fallback for boolean properties on older versions.
                 setattr(backend, attr, False)
 
 
@@ -327,6 +319,7 @@ class ImageNetteDataset(Dataset):
 
 class ViewAugmenter:
     """Create multiple augmented views of the same batch for ImageNette."""
+
     def __init__(self, num_views: int, img_size: int):
         self.num_views = num_views
         self.transform = v2.Compose(
@@ -407,7 +400,7 @@ def load_imagenette_non_iid(
         for client_id, count in enumerate(counts):
             if count == 0:
                 continue
-            client_indices[client_id].extend(idxs[cursor:cursor + count])
+            client_indices[client_id].extend(idxs[cursor : cursor + count])
             cursor += count
 
     client_data = []
@@ -479,8 +472,6 @@ def plot_reconstructions(
     title: str,
     num_images: int = 4,
 ) -> None:
-    # Gradient inversion can return tensors shaped like (B, V, 1, C, H, W).
-    # Normalize to (B, C, H, W) by removing singleton dimensions and picking view 0.
     if original.dim() == 6 and original.shape[2] == 1:
         original = original.squeeze(2)
     if reconstructed.dim() == 6 and reconstructed.shape[2] == 1:
@@ -527,6 +518,7 @@ def plot_reconstructions(
 
 class GradientInversionAttack:
     """Reconstruct data from gradients to measure privacy leakage."""
+
     def __init__(self, model: nn.Module):
         self.model = model
 
@@ -549,7 +541,7 @@ class GradientInversionAttack:
         tv_weight = 1e-4
 
         true_grad = true_grad.detach()
-        history = {}
+        history: Dict[int, torch.Tensor] = {}
         record_steps = set(record_steps or [])
         if 0 in record_steps:
             history[0] = dummy.detach().cpu().clone()
@@ -761,7 +753,6 @@ class FederatedServer:
                     stacked = torch.stack([t.to(base_tensor.dtype) for t in client_tensors], dim=0)
                     avg_state[key] = stacked.mean(dim=0)
                 else:
-                    # Preserve non-float parameters (e.g., buffers) from the first client
                     avg_state[key] = client_tensors[0]
             self.global_model.load_state_dict(avg_state)
 
@@ -794,8 +785,16 @@ def compute_gradients_for_data(
     return grads.detach().cpu()
 
 
-def plot_metric_curve(x: List[int], y_a: List[float], y_b: List[float], label_a: str,
-                      label_b: str, ylabel: str, title: str, save_path: str) -> None:
+def plot_metric_curve(
+    x: List[int],
+    y_a: List[float],
+    y_b: List[float],
+    label_a: str,
+    label_b: str,
+    ylabel: str,
+    title: str,
+    save_path: str,
+) -> None:
     if not x:
         return
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -811,9 +810,14 @@ def plot_metric_curve(x: List[int], y_a: List[float], y_b: List[float], label_a:
     plt.close(fig)
 
 
-def train_linear_probe(features: torch.Tensor, labels: torch.Tensor,
-                        test_features: torch.Tensor, test_labels: torch.Tensor,
-                        epochs: int = 10, lr: float = 1e-2) -> float:
+def train_linear_probe(
+    features: torch.Tensor,
+    labels: torch.Tensor,
+    test_features: torch.Tensor,
+    test_labels: torch.Tensor,
+    epochs: int = 10,
+    lr: float = 1e-2,
+) -> float:
     device = features.device
     probe = nn.Sequential(
         nn.BatchNorm1d(features.shape[1], affine=False),
@@ -837,8 +841,12 @@ def train_linear_probe(features: torch.Tensor, labels: torch.Tensor,
     return acc
 
 
-def extract_features(model: nn.Module, loader: DataLoader, model_type: str,
-                     device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+def extract_features(
+    model: nn.Module,
+    loader: DataLoader,
+    model_type: str,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     model.eval()
     feats = []
     labels = []
@@ -867,7 +875,7 @@ def extract_features_from_tensors(
     feats = []
     lbls = []
     for idx in range(0, len(data), batch_size):
-        batch = data[idx:idx + batch_size].to(device)
+        batch = data[idx : idx + batch_size].to(device)
         if model_type == "lejepa":
             views = batch.unsqueeze(1)
             emb = model.encoder(views)[0]
@@ -875,7 +883,7 @@ def extract_features_from_tensors(
         else:
             feat = model.encode(batch)
         feats.append(feat.detach().cpu())
-        lbls.append(labels[idx:idx + batch_size].cpu())
+        lbls.append(labels[idx : idx + batch_size].cpu())
     return torch.cat(feats, dim=0), torch.cat(lbls, dim=0)
 
 
@@ -928,30 +936,40 @@ def train_linear_probe_from_tensors(
 def initialize_loss_log(log_path: str) -> None:
     with open(log_path, "w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
-        writer.writerow([
-            "round",
-            "model",
-            "scope",
-            "client_id",
-            "loss_total",
-            "loss_inv",
-            "loss_sigreg",
-        ])
+        writer.writerow(
+            [
+                "round",
+                "model",
+                "scope",
+                "client_id",
+                "loss_total",
+                "loss_inv",
+                "loss_sigreg",
+            ]
+        )
 
 
-def append_loss_log(log_path: str, round_idx: int, model: str, scope: str,
-                    client_id: int, loss_components: Dict[str, float]) -> None:
+def append_loss_log(
+    log_path: str,
+    round_idx: int,
+    model: str,
+    scope: str,
+    client_id: int,
+    loss_components: Dict[str, float],
+) -> None:
     with open(log_path, "a", newline="", encoding="utf-8") as file:
         writer = csv.writer(file)
-        writer.writerow([
-            round_idx,
-            model,
-            scope,
-            client_id,
-            loss_components.get("total"),
-            loss_components.get("inv"),
-            loss_components.get("sigreg"),
-        ])
+        writer.writerow(
+            [
+                round_idx,
+                model,
+                scope,
+                client_id,
+                loss_components.get("total"),
+                loss_components.get("inv"),
+                loss_components.get("sigreg"),
+            ]
+        )
 
 
 def run_federated_privacy_experiment(cfg: Config) -> Dict[str, Dict[str, List[float]]]:
@@ -1338,6 +1356,4 @@ def parse_args() -> Config:
 
 
 if __name__ == "__main__":
-    from lejepa_privacy.experiments.imagenette import parse_args, run  # type: ignore[import-not-found]
-
     run(parse_args())

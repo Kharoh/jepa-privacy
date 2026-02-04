@@ -15,7 +15,9 @@ accuracy for both models.
 
 ## How to run
 1. Install dependencies from `requirements.txt`.
-2. Run `main.py` (it forwards to `imagenette_pipeline.py`).
+2. Run the script you want:
+	- MNIST: `scripts/run_mnist.py`
+	- ImageNette: `scripts/run_imagenette.py`
 
 The script downloads ImageNette automatically on first run.
 
@@ -26,6 +28,12 @@ The script downloads ImageNette automatically on first run.
 - `training_loss_curve.png`: LeJEPA/MAE training loss over rounds
 - `linear_probe_curve.png`: LeJEPA/MAE probe accuracy over rounds
 - `loss_components_log.csv`: per-round loss components for each client
+
+## Project layout
+- `src/lejepa_privacy/experiments/mnist.py`: MNIST pipeline (refactored).
+- `src/lejepa_privacy/experiments/imagenette.py`: ImageNette pipeline (refactored).
+- `scripts/`: convenience entrypoints.
+- `main.py` + `imagenette_pipeline.py`: legacy wrappers kept for backwards compatibility.
 
 ## Notes
 - Adjust `--num-rounds`, `--samples-per-client`, or `--eval-every` to trade off speed vs. fidelity.

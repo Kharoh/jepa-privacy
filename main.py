@@ -9,6 +9,12 @@ This script implements:
 5. Gradient inversion attacks for privacy quantification
 """
 
+from pathlib import Path
+import sys
+
+_ROOT = Path(__file__).resolve().parent
+sys.path.append(str(_ROOT / "src"))
+
 import copy
 import csv
 import torch
@@ -19,10 +25,13 @@ import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from torchvision import datasets, transforms
 from torchvision.transforms import functional as TF
+from torchvision.ops import MLP
+from torchvision.transforms import v2
 from torch.utils.data import DataLoader, TensorDataset
 from typing import Tuple, List, Dict
 from dataclasses import dataclass
 import warnings
+import timm
 warnings.filterwarnings('ignore')
 
 # Set seeds
@@ -94,6 +103,33 @@ def apply_dp_to_vector(
     return tensors[0], stats
 
 
+def _disable_cuda_sdp_kernels() -> None:
+    if not torch.cuda.is_available():
+        return
+    backend = torch.backends.cuda
+    if hasattr(backend, "sdp_kernel"):
+        backend.sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False)
+    for attr in (
+        "sdp_enabled",
+        "flash_sdp_enabled",
+        "scaled_dot_product_efficient_attention_enabled",
+        "enable_flash_sdp",
+        "enable_mem_efficient_sdp",
+        "enable_math_sdp",
+    ):
+        if hasattr(backend, attr):
+            try:
+                if "math" in attr:
+                    getattr(backend, attr)(True)
+                else:
+                    getattr(backend, attr)(False)
+            except TypeError:
+                setattr(backend, attr, False)
+
+
+_disable_cuda_sdp_kernels()
+
+
 # ============================================
 # SIGReg: Exact LeJEPA Implementation
 # ============================================
@@ -117,6 +153,40 @@ class SIGReg(torch.nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean()
+
+
+class ViTLeJEPAEncoder(nn.Module):
+    """ViT-based encoder + projection head for LeJEPA."""
+    def __init__(self, proj_dim: int, img_size: int,
+                 in_chans: int = 1,
+                 backbone_name: str = "vit_tiny_patch16_224",
+                 patch_size: int = 16,
+                 drop_path_rate: float = 0.1):
+        super().__init__()
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=False,
+            num_classes=0,
+            drop_path_rate=drop_path_rate,
+            img_size=img_size,
+            in_chans=in_chans,
+            patch_size=patch_size,  # override patch size
+        )
+        emb_dim = self.backbone.num_features
+        self.proj = MLP(emb_dim, [emb_dim * 4, emb_dim * 4, proj_dim], norm_layer=nn.BatchNorm1d)
+        self.in_chans = in_chans
+        self.img_size = img_size
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        b, v, d = x.shape
+        x = x.view(b * v, self.in_chans, self.img_size, self.img_size)
+        emb = self.backbone(x)
+        proj = self.proj(emb)
+        emb = emb.view(b, v, -1)
+        proj = proj.view(b, v, -1)
+        return emb, proj
 
 
 
@@ -204,16 +274,28 @@ class LeJEPAModel(nn.Module):
     across augmented views + SIGReg for Gaussian structure.
     """
     def __init__(self, input_dim: int, emb_dim: int = 64, proj_dim: int = 64,
-                 lamb: float = 0.5, use_cnn: bool = False,
-                 image_shape: Tuple[int, int, int] = (1, 28, 28)):
+                 lamb: float = 0.5, use_cnn: bool = False, use_vit: bool = False,
+                 image_shape: Tuple[int, int, int] = (1, 28, 28),
+                 vit_backbone: str = "vit_tiny_patch16_224"):
         super().__init__()
-        self.encoder = LeJEPAEncoder(
-            input_dim,
-            emb_dim,
-            proj_dim,
-            use_cnn=use_cnn,
-            image_shape=image_shape,
-        )
+        if use_vit:
+            _, height, width = image_shape
+            if height != width:
+                raise ValueError("ViT backbone requires square images")
+            self.encoder = ViTLeJEPAEncoder(
+                proj_dim=proj_dim,
+                img_size=height,
+                in_chans=image_shape[0],
+                backbone_name=vit_backbone,
+            )
+        else:
+            self.encoder = LeJEPAEncoder(
+                input_dim,
+                emb_dim,
+                proj_dim,
+                use_cnn=use_cnn,
+                image_shape=image_shape,
+            )
         self.sigreg = SIGReg(knots=17)
         self.lamb = lamb
         
@@ -351,6 +433,85 @@ class MAEModel(nn.Module):
         recon, latent, mask, original = self.forward(x)
         # Loss only on masked positions
         return F.mse_loss(recon * (~mask).float(), original * (~mask).float())
+
+
+class MAEViT(nn.Module):
+    """ViT-based MAE for MNIST-sized images."""
+    def __init__(self, img_size: int = 32, mask_ratio: float = 0.4,
+                 in_chans: int = 1, backbone_name: str = "vit_tiny_patch16_224",
+                 patch_size: int = 16,
+                 drop_path_rate: float = 0.1):
+        super().__init__()
+        self.encoder = timm.create_model(
+            backbone_name,
+            pretrained=False,
+            num_classes=0,
+            drop_path_rate=drop_path_rate,
+            img_size=img_size,
+            in_chans=in_chans,
+            patch_size=patch_size,  # override patch size
+        )
+        self.mask_ratio = mask_ratio
+        patch_size = self.encoder.patch_embed.patch_size
+        self.patch_size = patch_size[0] if isinstance(patch_size, tuple) else patch_size
+        self.num_patches = self.encoder.patch_embed.num_patches
+        self.embed_dim = self.encoder.embed_dim
+        self.in_chans = in_chans
+        patch_dim = self.patch_size * self.patch_size * in_chans
+        self.decoder = nn.Sequential(
+            nn.LayerNorm(self.embed_dim),
+            nn.Linear(self.embed_dim, patch_dim),
+        )
+
+    def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
+        p = self.patch_size
+        b, c, h, w = imgs.shape
+        imgs = imgs.reshape(b, c, h // p, p, w // p, p)
+        imgs = imgs.permute(0, 2, 4, 3, 5, 1)
+        return imgs.reshape(b, -1, p * p * c)
+
+    def unpatchify(self, patches: torch.Tensor) -> torch.Tensor:
+        p = self.patch_size
+        b, n, _ = patches.shape
+        h = w = int((n) ** 0.5)
+        patches = patches.reshape(b, h, w, p, p, self.in_chans)
+        patches = patches.permute(0, 5, 1, 3, 2, 4)
+        return patches.reshape(b, self.in_chans, h * p, w * p)
+
+    def encode(self, imgs: torch.Tensor) -> torch.Tensor:
+        tokens = self.encoder.forward_features(imgs)
+        if tokens.dim() == 2:
+            return tokens
+        if tokens.shape[1] == self.num_patches + 1:
+            tokens = tokens[:, 1:, :]
+        return tokens.mean(dim=1)
+
+    def forward(self, imgs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if imgs.dim() == 3:
+            imgs = imgs[:, 0, :]
+        if imgs.dim() == 2:
+            side = int(np.sqrt(imgs.shape[1]))
+            imgs = imgs.view(-1, self.in_chans, side, side)
+        patches = self.patchify(imgs)
+        b, n, _ = patches.shape
+        mask = torch.rand(b, n, device=imgs.device) < self.mask_ratio
+        masked_patches = patches.clone()
+        masked_patches[mask] = 0.0
+        masked_imgs = self.unpatchify(masked_patches)
+        tokens = self.encoder.forward_features(masked_imgs)
+        if tokens.dim() == 2:
+            tokens = tokens.unsqueeze(1).expand(b, n, -1)
+        if tokens.shape[1] == self.num_patches + 1:
+            tokens = tokens[:, 1:, :]
+        pred = self.decoder(tokens)
+        return pred, patches, mask
+
+    def reconstruction_loss(self, imgs: torch.Tensor) -> torch.Tensor:
+        pred, target, mask = self.forward(imgs)
+        if mask.sum() == 0:
+            # Ensure loss stays connected to the graph by falling back to full MSE
+            return F.mse_loss(pred, target)
+        return ((pred - target) ** 2)[mask].mean()
 
 
 # ============================================
@@ -539,23 +700,23 @@ class GradientInversionAttack:
             # Compute dummy loss
             if isinstance(self.model, LeJEPAModel):
                 loss = self.model.compute_loss(dummy)['total']
-            elif isinstance(self.model, MAEModel):
+            elif isinstance(self.model, (MAEModel, MAEViT)):
                 loss = self.model.reconstruction_loss(dummy)
 
-            # Compute gradients w.r.t. model params
-            param_grads = torch.autograd.grad(
+            # Compute gradients w.r.t. model params via autograd so the gradient-matching loss remains connected to dummy
+            params = [p for p in self.model.parameters() if p.requires_grad]
+            grads = torch.autograd.grad(
                 loss,
-                [p for p in self.model.parameters() if p.requires_grad],
+                params,
                 create_graph=True,
                 retain_graph=True,
                 allow_unused=True,
             )
-
-            grads_flat = [g.flatten() for g in param_grads if g is not None]
+            grads_flat = [g.reshape(-1) for g in grads if g is not None]
             if len(grads_flat) == 0:
                 break
-
             dummy_grad = torch.cat(grads_flat)
+
 
             # --- IMPROVEMENT 2: Gradient Matching Loss ---
             if loss_strategy == "cosine":
@@ -587,6 +748,7 @@ class GradientInversionAttack:
             total_loss = grad_loss + (tv_weight * tv_loss)
 
             # Update dummy
+            opt.zero_grad()
             total_loss.backward()
             opt.step()
             
@@ -608,6 +770,10 @@ class GradientInversionAttack:
             
         if reconstructed.dim() == 3:
             reconstructed = reconstructed[:, 0, :]
+
+        if original.device != reconstructed.device:
+            reconstructed = reconstructed.cpu()
+        original = original.cpu()
             
         metrics = {}
         
@@ -650,113 +816,65 @@ class ViewAugmenter:
         mask_ratio: float = 0.4,
         noise_std: float = 0.1,
         image_shape: Tuple[int, int, int] = (1, 28, 28),
-        rotation_deg: float = 20.0,
-        translation_px: int = 3,
-        scale_range: Tuple[float, float] = (0.9, 1.1),
-        contrast_range: Tuple[float, float] = (0.8, 1.2),
-        brightness_range: Tuple[float, float] = (0.85, 1.15),
-        blur_prob: float = 0.25,
+        device: str = "cuda",  # Add device parameter
+        **kwargs  # Simplify init by removing unused params or grouping them
     ):
         self.num_views = num_views
         self.mask_ratio = mask_ratio
         self.noise_std = noise_std
         self.image_shape = image_shape
-        self.rotation_deg = rotation_deg
-        self.translation_px = translation_px
-        self.scale_range = scale_range
-        self.contrast_range = contrast_range
-        self.brightness_range = brightness_range
-        self.blur_prob = blur_prob
-        self.apply_transforms = any([
-            rotation_deg != 0,
-            translation_px != 0,
-            scale_range != (1.0, 1.0),
-            contrast_range is not None,
-            brightness_range is not None,
-            blur_prob > 0,
-        ])
-        if self.apply_transforms:
-            _, height, width = self.image_shape
-            self.view_transform = transforms.Compose([
-                transforms.ToPILImage(),
-                transforms.RandomResizedCrop((height, width), scale=(0.5, 1.0)),
-                transforms.RandomApply([
-                    transforms.ColorJitter(0.4, 0.4, 0.4, 0.1)
-                ], p=0.8),
-                transforms.RandomGrayscale(p=0.2),
-                transforms.GaussianBlur(kernel_size=3),
-                transforms.ToTensor(),
-            ])
-        else:
-            self.view_transform = None
-
-    def _apply_view_transforms(self, images: torch.Tensor) -> torch.Tensor:
-        """Apply random spatial and photometric transforms to a batch of images."""
-        if not self.apply_transforms:
-            return images
-
-        channels, height, width = self.image_shape
-        angle = float(torch.empty(1).uniform_(-self.rotation_deg, self.rotation_deg).item())
-        translate_x = int(torch.randint(-self.translation_px, self.translation_px + 1, (1,)).item())
-        translate_y = int(torch.randint(-self.translation_px, self.translation_px + 1, (1,)).item())
-        scale = float(torch.empty(1).uniform_(self.scale_range[0], self.scale_range[1]).item())
-        shear = [0.0, 0.0]
-
-        augmented = []
-        for img in images:
-            img = TF.affine(
-                img,
-                angle=angle,
-                translate=[translate_x, translate_y],
-                scale=scale,
-                shear=shear,
-                interpolation=TF.InterpolationMode.BILINEAR,
-            )
-            if self.contrast_range:
-                contrast = float(torch.empty(1).uniform_(self.contrast_range[0], self.contrast_range[1]).item())
-                img = TF.adjust_contrast(img, contrast)
-            if self.brightness_range:
-                brightness = float(torch.empty(1).uniform_(self.brightness_range[0], self.brightness_range[1]).item())
-                img = TF.adjust_brightness(img, brightness)
-            if self.blur_prob > 0 and torch.rand(1).item() < self.blur_prob:
-                img = TF.gaussian_blur(img, kernel_size=3, sigma=(0.1, 1.0))
-            if self.view_transform is not None:
-                device = img.device
-                img = self.view_transform(img.detach().cpu()).to(device)
-            augmented.append(img)
-
-        return torch.stack(augmented, dim=0)
+        self.device = device
         
+        # Use torchvision v2 transforms - batched and GPU-compatible
+        self.spatial_transform = v2.RandomAffine(
+            degrees=kwargs.get('rotation_deg', 20.0),
+            translate=(kwargs.get('translation_px', 3) / 28, 
+                      kwargs.get('translation_px', 3) / 28),  # normalized
+            scale=kwargs.get('scale_range', (0.9, 1.1)),
+            interpolation=v2.InterpolationMode.BILINEAR
+        )
+        
+        self.color_transform = v2.Compose([
+            v2.ColorJitter(
+                brightness=kwargs.get('brightness_range', (0.85, 1.15)),
+                contrast=kwargs.get('contrast_range', (0.8, 1.2)),
+                saturation=0.0,  # grayscale images
+                hue=0.0
+            ),
+            v2.RandomApply([
+                v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))
+            ], p=kwargs.get('blur_prob', 0.25)),
+        ])
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: (B, input_dim) - batch of samples
-        
-        Returns: (B, num_views, input_dim) - B samples, each with num_views augmented versions
+        Returns: (B, num_views, input_dim)
         """
         B, D = x.shape
-        views = []
         channels, height, width = self.image_shape
-
-        x_img = x.view(B, channels, height, width)
         
+        # Move to device early and reshape once
+        x_img = x.view(B, channels, height, width).to(self.device)
+        
+        views = []
         for _ in range(self.num_views):
-            view_img = x_img.clone()
-            view_img = self._apply_view_transforms(view_img)
-            view = view_img.view(B, -1)
+            view = x_img.clone()
             
-            # Random masking (different mask for each view)
+            # Apply batched transforms (no loops!)
+            view = self.spatial_transform(view)
+            view = self.color_transform(view)
+            
+            # Flatten and mask/noise (vectorized)
+            view = view.view(B, -1)
             mask = torch.rand_like(view) > self.mask_ratio
             view = view * mask.float()
             
-            # Add Gaussian noise (different noise for each view)
             if self.noise_std > 0:
-                noise = torch.randn_like(view) * self.noise_std
-                view = view + noise
-            view = view.clamp(0.0, 1.0)
+                view = view + torch.randn_like(view) * self.noise_std
             
-            views.append(view.unsqueeze(1))
+            views.append(view.clamp(0.0, 1.0).unsqueeze(1))
             
-        # Concatenate: (B, num_views, input_dim)
         return torch.cat(views, dim=1)
 
 
@@ -1068,7 +1186,8 @@ def plot_reconstruction_steps_by_class(
     plt.close(fig)
 
 
-def extract_latents_for_tsne(model: nn.Module, data: torch.Tensor, model_type: str) -> torch.Tensor:
+def extract_latents_for_tsne(model: nn.Module, data: torch.Tensor, model_type: str,
+                             image_shape: Tuple[int, int, int] = None) -> torch.Tensor:
     """Extract latent vectors for t-SNE visualization."""
     model.eval()
     device = next(model.parameters()).device
@@ -1076,10 +1195,26 @@ def extract_latents_for_tsne(model: nn.Module, data: torch.Tensor, model_type: s
         if model_type == "lejepa":
             if data.dim() == 2:
                 data = data.unsqueeze(1)
+            elif data.dim() == 3 and data.shape[1] != 1:
+                data = data[:, :1, :]
             emb, _ = model.encoder(data.to(device))
             latents = emb.mean(dim=1)
         else:
-            latents = model.encode(data.to(device)) if hasattr(model, "encode") else model.encoder(data.to(device))
+            input_tensor = data.to(device)
+            if image_shape is not None:
+                c, h, w = image_shape
+            else:
+                c = 1
+                h = w = int(np.sqrt(input_tensor.shape[-1])) if input_tensor.dim() == 2 else int(np.sqrt(input_tensor.shape[-2]))
+            if input_tensor.dim() == 2:
+                input_tensor = input_tensor.view(-1, c, h, w)
+            elif input_tensor.dim() == 3:
+                if input_tensor.shape[1] != c:
+                    input_tensor = input_tensor.view(input_tensor.shape[0], c, h, w)
+            if hasattr(model, "encode"):
+                latents = model.encode(input_tensor)
+            else:
+                latents = model.encoder(input_tensor)
     return latents.detach().cpu()
 
 
@@ -1113,9 +1248,10 @@ def plot_tsne_for_validation(model: nn.Module,
                              labels: torch.Tensor,
                              model_type: str,
                              save_path: str,
-                             title: str) -> None:
+                             title: str,
+                             image_shape: Tuple[int, int, int] = None) -> None:
     """Plot t-SNE embeddings for validation samples (no augmentation)."""
-    latents = extract_latents_for_tsne(model, data, model_type)
+    latents = extract_latents_for_tsne(model, data, model_type, image_shape=image_shape)
     plot_tsne_latents(latents, labels, save_path=save_path, title=title)
 
 
@@ -1139,7 +1275,8 @@ def plot_metric_curve(x: List[int], y_a: List[float], y_b: List[float],
 
 
 def extract_features(model: nn.Module, data: torch.Tensor, model_type: str,
-                     batch_size: int = 256) -> torch.Tensor:
+                     batch_size: int = 256,
+                     image_shape: Tuple[int, int, int] = (1, 28, 28)) -> torch.Tensor:
     """Extract frozen features for linear probing."""
     model.eval()
     device = next(model.parameters()).device
@@ -1154,10 +1291,17 @@ def extract_features(model: nn.Module, data: torch.Tensor, model_type: str,
                 emb, _ = model.encoder(batch)
                 feats = emb[:, 0, :]
             else:
-                if hasattr(model, "encode"):
-                    feats = model.encode(batch)
-                else:
-                    feats = model.encoder(batch)
+                    if batch.dim() == 2:
+                        expected_dim = image_shape[0] * image_shape[1] * image_shape[2]
+                        if batch.shape[1] != expected_dim:
+                            raise ValueError(
+                                f"Expected flattened input dim {expected_dim}, got {batch.shape[1]}"
+                            )
+                        batch = batch.view(-1, *image_shape)
+                    if hasattr(model, "encode"):
+                        feats = model.encode(batch)
+                    else:
+                        feats = model.encoder(batch)
             features.append(feats.detach().cpu())
 
     return torch.cat(features, dim=0)
@@ -1166,12 +1310,13 @@ def extract_features(model: nn.Module, data: torch.Tensor, model_type: str,
 def train_linear_probe(model: nn.Module, train_data: torch.Tensor, train_labels: torch.Tensor,
                        test_data: torch.Tensor, test_labels: torch.Tensor,
                        model_type: str, epochs: int = 20, lr: float = 1e-2,
-                       batch_size: int = 256) -> float:
+                       batch_size: int = 256,
+                       image_shape: Tuple[int, int, int] = (1, 28, 28)) -> float:
     """Train a detached linear probe with Batch Normalization."""
     
     # 1. Extract features (frozen representations)
-    train_features = extract_features(model, train_data, model_type)
-    test_features = extract_features(model, test_data, model_type)
+    train_features = extract_features(model, train_data, model_type, image_shape=image_shape)
+    test_features = extract_features(model, test_data, model_type, image_shape=image_shape)
 
     device = next(model.parameters()).device
     feat_dim = train_features.shape[1]
@@ -1229,6 +1374,7 @@ class FederatedClient:
         self.augmenter = ViewAugmenter(
             num_views=num_views,
             image_shape=image_shape,
+            device=device,
             **(augmenter_kwargs or {})
         )
         self.device = device
@@ -1262,7 +1408,10 @@ class FederatedClient:
                 loss_dict = local_model.compute_loss(x_views)
                 loss = loss_dict['total']
             else:
-                loss = local_model.reconstruction_loss(x_batch)
+                x_aug = self.augmenter(x_batch)
+                if x_aug.dim() == 3:
+                    x_aug = x_aug[:, 0, :]
+                loss = local_model.reconstruction_loss(x_aug)
                 
             loss.backward()
             optimizer.step()
@@ -1283,7 +1432,10 @@ class FederatedClient:
             sigreg_loss = loss_dict['sigreg'].item()
         else:
             local_model.zero_grad()
-            loss = local_model.reconstruction_loss(x_test)
+            x_test_aug = self.augmenter(x_test)
+            if x_test_aug.dim() == 3:
+                x_test_aug = x_test_aug[:, 0, :]
+            loss = local_model.reconstruction_loss(x_test_aug)
             inv_loss = None
             sigreg_loss = None
             
@@ -1341,9 +1493,18 @@ class FederatedServer:
             # Average all parameters
             avg_state = {}
             for key in self.global_model.state_dict().keys():
-                avg_state[key] = torch.stack([
-                    client['model_state'][key] for client in client_updates
-                ]).mean(dim=0)
+                stacked = []
+                for client in client_updates:
+                    tensor = client['model_state'][key]
+                    if not tensor.is_floating_point():
+                        tensor = tensor.to(torch.float32)
+                    stacked.append(tensor)
+                stacked = torch.stack(stacked)
+                avg = stacked.mean(dim=0)
+                ref = client_updates[0]['model_state'][key]
+                if not ref.is_floating_point():
+                    avg = avg.round().to(ref.dtype)
+                avg_state[key] = avg
                 
             self.global_model.load_state_dict(avg_state)
 
@@ -1359,33 +1520,37 @@ def run_federated_privacy_experiment():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Configuration
-    INPUT_DIM = 16 * 16
+    INPUT_DIM = 32 * 32
     EMB_DIM = 32
     PROJ_DIM = 16
     NUM_CLIENTS = 5
-    SAMPLES_PER_CLIENT = 10000
+    SAMPLES_PER_CLIENT = 15000
     TOTAL_SAMPLES = NUM_CLIENTS * SAMPLES_PER_CLIENT
-    DIRICHLET_ALPHA = 0.7
+    DIRICHLET_ALPHA = 10.0
     NUM_ROUNDS = 10000
-    NUM_VIEWS = 2
+    NUM_VIEWS = 4
     LAMB = 0.005  # LeJEPA: balance between SIGReg and invariance
-    USE_CNN = True
-    IMAGE_SHAPE = (1, 16, 16)
+    USE_CNN = False
+    USE_VIT = True
+    IMAGE_SHAPE = (1, 32, 32)
     EVAL_EVERY = 250
-    PLOT_ROUNDS = np.linspace(0, NUM_ROUNDS - 1, 10, dtype=int)
-    PLOT_CLASSES = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-    PLOT_STEPS = [0, 50, 100, 200, 400, 600, 800]
+    PLOT_ROUNDS = np.linspace(0, NUM_ROUNDS - 1, 20, dtype=int)
+    PLOT_CLASSES = [0, 1, 2]
+    PLOT_STEPS = [0, 50, 100, 200, 400]
     PLOT_ATTACK_ITERS = max(PLOT_STEPS)
     LOSS_LOG_PATH = "loss_components_log.csv"
     mnist_transform = create_mnist_transform(IMAGE_SHAPE)
     # View augmentation parameters (masking only)
-    AUG_ROTATION_DEG = 10.0
-    AUG_TRANSLATION_PX = 3
-    AUG_SCALE_RANGE = (1.0, 1.0)
-    AUG_CONTRAST_RANGE = None
-    AUG_BRIGHTNESS_RANGE = None
-    AUG_BLUR_PROB = 0.0
-    AUG_NOISE_STD = 0.0
+    AUG_ROTATION_DEG = 25.0
+    AUG_TRANSLATION_PX = 4
+    AUG_SCALE_RANGE = (0.8, 1.2)
+    AUG_CONTRAST_RANGE = (0.7, 1.3)
+    AUG_BRIGHTNESS_RANGE = (0.7, 1.3)
+    AUG_BLUR_PROB = 0.35
+    AUG_NOISE_STD = 0.05
+    AUG_PERSPECTIVE_PROB = 0.25
+    AUG_SOLARIZE_PROB = 0.2
+    AUG_SOLARIZE_THRESHOLD = 128
     AUGMENTER_KWARGS = {
         "mask_ratio": 0.0,
         "noise_std": AUG_NOISE_STD,
@@ -1395,6 +1560,9 @@ def run_federated_privacy_experiment():
         "contrast_range": AUG_CONTRAST_RANGE,
         "brightness_range": AUG_BRIGHTNESS_RANGE,
         "blur_prob": AUG_BLUR_PROB,
+        "perspective_prob": AUG_PERSPECTIVE_PROB,
+        "solarize_prob": AUG_SOLARIZE_PROB,
+        "solarize_threshold": AUG_SOLARIZE_THRESHOLD,
     }
 
     # Differential privacy configuration
@@ -1448,18 +1616,27 @@ def run_federated_privacy_experiment():
         PROJ_DIM,
         lamb=LAMB,
         use_cnn=USE_CNN,
+        use_vit=USE_VIT,
         image_shape=IMAGE_SHAPE,
     )
-    mae_model = MAEModel(
-        INPUT_DIM,
-        EMB_DIM,
-        use_cnn=USE_CNN,
-        image_shape=IMAGE_SHAPE,
-    )
+    if USE_VIT:
+        mae_model = MAEViT(
+            img_size=IMAGE_SHAPE[1],
+            mask_ratio=0.4,
+            in_chans=IMAGE_SHAPE[0],
+            patch_size=16,  # 64 patches for 32x32 images
+        )
+    else:
+        mae_model = MAEModel(
+            INPUT_DIM,
+            EMB_DIM,
+            use_cnn=USE_CNN,
+            image_shape=IMAGE_SHAPE,
+        )
     lejepa_model.to(device)
     mae_model.to(device)
-    print(f"  LeJEPA: emb_dim={EMB_DIM}, proj_dim={PROJ_DIM}, lambda={LAMB}, cnn={USE_CNN}")
-    print(f"  MAE: latent_dim={EMB_DIM}, cnn={USE_CNN}")
+    print(f"  LeJEPA: proj_dim={PROJ_DIM}, lambda={LAMB}, cnn={USE_CNN}, vit={USE_VIT}")
+    print(f"  MAE: latent_dim={EMB_DIM}, cnn={USE_CNN}, vit={USE_VIT}")
     
     # Create clients
     lejepa_clients = [FederatedClient(
@@ -1637,7 +1814,7 @@ def run_federated_privacy_experiment():
                 iterations=600,
                 loss_strategy="cosine"
             )
-            lejepa_metrics = lejepa_attacker.compute_metrics(x_test_views, lejepa_recon)
+            lejepa_metrics = lejepa_attacker.compute_metrics(x_test_views.cpu(), lejepa_recon.cpu())
             
             # results['lejepa']['mi'].append(lejepa_mi)
             results['lejepa']['mse'].append(lejepa_metrics['mse'])
@@ -1660,7 +1837,7 @@ def run_federated_privacy_experiment():
                 iterations=600,
                 loss_strategy="cosine"
             )
-            mae_metrics = mae_attacker.compute_metrics(x_test, mae_recon)
+            mae_metrics = mae_attacker.compute_metrics(x_test.cpu(), mae_recon.cpu())
             
             # results['mae']['mi'].append(mae_mi)
             results['mae']['mse'].append(mae_metrics['mse'])
@@ -1770,7 +1947,8 @@ def run_federated_privacy_experiment():
                 val_labels,
                 model_type="lejepa",
                 save_path=f"lejepa_tsne_round{round_idx + 1}_val.png",
-                title=f"LeJEPA Validation t-SNE (Round {round_idx + 1})"
+                title=f"LeJEPA Validation t-SNE (Round {round_idx + 1})",
+                image_shape=IMAGE_SHAPE
             )
             plot_tsne_for_validation(
                 mae_server.global_model,
@@ -1778,7 +1956,8 @@ def run_federated_privacy_experiment():
                 val_labels,
                 model_type="mae",
                 save_path=f"mae_tsne_round{round_idx + 1}_val.png",
-                title=f"MAE Validation t-SNE (Round {round_idx + 1})"
+                title=f"MAE Validation t-SNE (Round {round_idx + 1})",
+                image_shape=IMAGE_SHAPE
             )
 
         if round_idx in PLOT_ROUNDS:
@@ -1794,7 +1973,8 @@ def run_federated_privacy_experiment():
                 train_labels,
                 test_data,
                 test_labels,
-                model_type="lejepa"
+                model_type="lejepa",
+                image_shape=IMAGE_SHAPE,
             )
             mae_probe_acc = train_linear_probe(
                 mae_server.global_model,
@@ -1802,7 +1982,8 @@ def run_federated_privacy_experiment():
                 train_labels,
                 test_data,
                 test_labels,
-                model_type="mae"
+                model_type="mae",
+                image_shape=IMAGE_SHAPE,
             )
             results['lejepa']['probe_acc'].append(lejepa_probe_acc)
             results['lejepa']['probe_rounds'].append(round_idx)
@@ -1938,5 +2119,7 @@ def run_federated_privacy_experiment():
 
 
 if __name__ == "__main__":
-    results = run_federated_privacy_experiment()
+    from lejepa_privacy.experiments.mnist import run  # type: ignore[import-not-found]
+
+    run()
 

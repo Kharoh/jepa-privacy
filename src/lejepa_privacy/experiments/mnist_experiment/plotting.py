@@ -63,6 +63,7 @@ def plot_reconstructions(
     image_shape: Tuple[int, int, int] | None = None,
     normalize_mean: float = 0.1307,
     normalize_std: float = 0.3081,
+    denormalize: bool = True,
 ) -> None:
     """Plot original vs reconstructed images in a 2xN grid."""
     if original.dim() == 3:
@@ -70,8 +71,9 @@ def plot_reconstructions(
     if reconstructed.dim() == 3:
         reconstructed = reconstructed[:, 0, :]
 
-    original = denormalize_mnist(original, normalize_mean, normalize_std)
-    reconstructed = denormalize_mnist(reconstructed, normalize_mean, normalize_std)
+    if denormalize:
+        original = denormalize_mnist(original, normalize_mean, normalize_std)
+        reconstructed = denormalize_mnist(reconstructed, normalize_mean, normalize_std)
 
     height, width = _resolve_image_hw(image_shape, flat_dim=original.shape[-1])
     original = original[:num_images].reshape(-1, height, width).cpu()
@@ -101,6 +103,7 @@ def plot_reconstruction_steps_by_class(
     image_shape: Tuple[int, int, int] | None = None,
     normalize_mean: float = 0.1307,
     normalize_std: float = 0.3081,
+    denormalize: bool = True,
 ) -> None:
     """Plot reconstruction snapshots for multiple classes across steps."""
     classes = sorted(originals_by_class.keys())
@@ -119,7 +122,8 @@ def plot_reconstruction_steps_by_class(
         original = originals_by_class[cls]
         if original.dim() == 3:
             original = original[:, 0, :]
-        original = denormalize_mnist(original, normalize_mean, normalize_std)
+        if denormalize:
+            original = denormalize_mnist(original, normalize_mean, normalize_std)
         height, width = _resolve_image_hw(image_shape, flat_dim=original.shape[-1])
         img = original[0].reshape(height, width).cpu()
         axes[0, col].imshow(img, cmap="gray")
@@ -134,7 +138,8 @@ def plot_reconstruction_steps_by_class(
                 continue
             if recon.dim() == 3:
                 recon = recon[:, 0, :]
-            recon = denormalize_mnist(recon, normalize_mean, normalize_std)
+            if denormalize:
+                recon = denormalize_mnist(recon, normalize_mean, normalize_std)
             img = recon[0].reshape(height, width).cpu()
             axes[row, col].imshow(img, cmap="gray")
             axes[row, col].axis("off")
@@ -223,6 +228,49 @@ def plot_metric_curve(
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
     ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_tradeoff_curve(
+    privacy_vals: List[float],
+    utility_vals: List[float],
+    label: str,
+    xlabel: str,
+    ylabel: str,
+    title: str,
+    save_path: str,
+) -> None:
+    if len(privacy_vals) == 0 or len(utility_vals) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.scatter(privacy_vals, utility_vals, alpha=0.8, label=label)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_scalar_curve(
+    x: List[int],
+    y: List[float],
+    ylabel: str,
+    title: str,
+    save_path: str,
+) -> None:
+    if len(x) == 0:
+        return
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(x, y, marker="o")
+    ax.set_xlabel("Round")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(save_path, dpi=150)
     plt.close(fig)

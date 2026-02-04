@@ -45,6 +45,8 @@ class ExperimentConfig:
     batch_size: int = 128
     local_epochs: int = 1
     max_batches_per_epoch: int | None = None
+    optimizer: str = "sgd"
+    learning_rate: float = 1e-3
 
     normalize_mean: float = 0.1307
     normalize_std: float = 0.3081
@@ -86,6 +88,16 @@ class ExperimentConfig:
     )
 
     dp_config: DPConfig = field(default_factory=DPConfig)
+
+    align_augmentations: bool = True
+    attack_on: str = "updates"
+    attack_loss_strategies: List[str] = field(default_factory=lambda: ["cosine", "mse"])
+    attack_eval_clients: int = 1
+    attack_eval_batches: int = 1
+    attack_success_mse_threshold: float = 0.05
+    attack_use_raw_data: bool = True
+    attack_deterministic_augment: bool = True
+    attack_seed: int = 123
 
     output_dir: str = "results"
     checkpoint_every: int = 250

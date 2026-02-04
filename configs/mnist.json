@@ -20,7 +20,9 @@
   "plot_steps": [0, 50, 100, 200, 400],
   "batch_size": 128,
   "local_epochs": 1,
-  "max_batches_per_epoch": null,
+  "max_batches_per_epoch": 1,
+  "optimizer": "sgd",
+  "learning_rate": 0.001,
   "normalize_mean": 0.1307,
   "normalize_std": 0.3081,
   "augmenter_kwargs": {
@@ -62,6 +64,15 @@
     "apply_to_gradients": true,
     "apply_to_updates": true
   },
+  "align_augmentations": true,
+  "attack_on": "updates",
+  "attack_loss_strategies": ["cosine", "mse"],
+  "attack_eval_clients": 3,
+  "attack_eval_batches": 1,
+  "attack_success_mse_threshold": 0.05,
+  "attack_use_raw_data": true,
+  "attack_deterministic_augment": true,
+  "attack_seed": 123,
   "output_dir": "results",
   "checkpoint_every": 250,
   "resume_from": null

@@ -24,6 +24,8 @@ class ViewAugmenter:
         normalize_std: float = 0.3081,
         mask_mode: str = "pixel",
         patch_size: int = 4,
+        deterministic: bool = False,
+        base_seed: int = 42,
         **kwargs,
     ):
         self.num_views = num_views
@@ -35,6 +37,9 @@ class ViewAugmenter:
         self.normalize_std = normalize_std
         self.mask_mode = mask_mode
         self.patch_size = patch_size
+        self.deterministic = deterministic
+        self.base_seed = base_seed
+        self._call_count = 0
 
         self.spatial_transform = v2.RandomAffine(
             degrees=kwargs.get("rotation_deg", 20.0),
@@ -113,24 +118,36 @@ class ViewAugmenter:
 
         views = []
         for _ in range(self.num_views):
-            view = x_img.clone()
-
-            view = self.spatial_transform(view)
-            view = self.color_transform(view)
-            view = self.perspective(view)
-            view = self.solarize(view)
-
-            view = view.view(b, -1)
-            view = self._apply_mask(view)
-
-            if self.noise_std > 0:
-                view = view + torch.randn_like(view) * self.noise_std
-
-            view = normalize_mnist(view, self.normalize_mean, self.normalize_std)
+            if self.deterministic:
+                seed = self.base_seed + self._call_count
+                self._call_count += 1
+                with torch.random.fork_rng(devices=[x_img.device] if x_img.is_cuda else []):
+                    torch.manual_seed(seed)
+                    view = self._apply_transforms(x_img)
+            else:
+                view = self._apply_transforms(x_img)
 
             views.append(view.unsqueeze(1))
 
         return torch.cat(views, dim=1)
+
+    def _apply_transforms(self, x_img: torch.Tensor) -> torch.Tensor:
+        view = x_img.clone()
+
+        view = self.spatial_transform(view)
+        view = self.color_transform(view)
+        view = self.perspective(view)
+        view = self.solarize(view)
+
+        b = view.shape[0]
+        view = view.view(b, -1)
+        view = self._apply_mask(view)
+
+        if self.noise_std > 0:
+            view = view + torch.randn_like(view) * self.noise_std
+
+        view = normalize_mnist(view, self.normalize_mean, self.normalize_std)
+        return view
 
 
 class IdentityAugmenter:

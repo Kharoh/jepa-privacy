@@ -10,7 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT / "src"))
 
 from lejepa_privacy.experiments.mnist_experiment.config import ExperimentConfig
-from lejepa_privacy.experiments.mnist_experiment.privacy import GradientInversionAttack
+from lejepa_privacy.experiments.mnist_experiment.privacy import (
+    GradientInversionAttack,
+    UpdateInversionAttack,
+)
 from lejepa_privacy.experiments.mnist_experiment.training import run_federated_privacy_experiment
 from lejepa_privacy.experiments.mnist_experiment.utils import setup_logging
 
@@ -87,8 +90,10 @@ class TestMNISTPipeline(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             logger = setup_logging(tmpdir)
             try:
-                with mock.patch.object(GradientInversionAttack, "attack", new=_fast_attack), mock.patch(
-                    "torch.cuda.is_available", return_value=False
+                with (
+                    mock.patch.object(GradientInversionAttack, "attack", new=_fast_attack),
+                    mock.patch.object(UpdateInversionAttack, "attack", new=_fast_attack),
+                    mock.patch("torch.cuda.is_available", return_value=False),
                 ):
                     results = run_federated_privacy_experiment(config, Path(tmpdir), logger)
             finally:

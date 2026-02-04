@@ -313,6 +313,7 @@ class GradientInversionAttack:
         reconstructed: torch.Tensor,
         denormalize_fn: Callable[[torch.Tensor], torch.Tensor] | None = None,
         data_range: float = 1.0,
+        clip_range: Tuple[float, float] = (0.0, 1.0),
     ) -> Dict[str, float]:
         """Compute privacy leakage metrics."""
         if original.dim() == 3:
@@ -328,6 +329,11 @@ class GradientInversionAttack:
         if denormalize_fn is not None:
             original = denormalize_fn(original)
             reconstructed = denormalize_fn(reconstructed)
+
+        if clip_range is not None:
+            low, high = clip_range
+            original = original.clamp(low, high)
+            reconstructed = reconstructed.clamp(low, high)
 
         metrics: Dict[str, float] = {}
 
@@ -353,6 +359,116 @@ class GradientInversionAttack:
         ).item()
 
         return metrics
+
+
+class UpdateInversionAttack:
+    """
+    Reconstruct data from model updates (FedAvg-style) by matching a one-step
+    SGD update computed on dummy data.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        input_dim: int,
+        num_views: int = 2,
+        view_augmenter: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    ):
+        self.model = model
+        self.input_dim = input_dim
+        self.num_views = num_views
+        self.view_augmenter = view_augmenter
+
+    def _prepare_views(self, dummy: torch.Tensor, model: nn.Module) -> torch.Tensor:
+        if isinstance(model, LeJEPAModel):
+            if dummy.dim() == 2:
+                if self.view_augmenter is None:
+                    raise ValueError("view_augmenter required for LeJEPA update inversion")
+                return self.view_augmenter(dummy)
+            return dummy
+        if dummy.dim() == 3:
+            return dummy[:, 0, :]
+        if self.view_augmenter is not None and dummy.dim() == 2:
+            aug = self.view_augmenter(dummy)
+            if aug.dim() == 3:
+                return aug[:, 0, :]
+            return aug
+        return dummy
+
+    def _compute_update_vector(self, dummy: torch.Tensor, lr: float) -> torch.Tensor:
+        model_copy = copy.deepcopy(self.model)
+        model_copy.zero_grad(set_to_none=True)
+        model_copy.train()
+
+        views = self._prepare_views(dummy, model_copy)
+        if isinstance(model_copy, LeJEPAModel):
+            loss = model_copy.compute_loss(views)["total"]
+        elif isinstance(model_copy, (MAEModel, MAEViT)):
+            loss = model_copy.reconstruction_loss(views)
+        else:
+            raise ValueError("Unknown model type for update inversion")
+
+        loss.backward()
+
+        updates = []
+        with torch.no_grad():
+            for param in model_copy.parameters():
+                if param.grad is None:
+                    continue
+                updates.append((-lr * param.grad).flatten())
+        if not updates:
+            raise RuntimeError("No gradients found for update inversion")
+        return torch.cat(updates)
+
+    def attack(
+        self,
+        original_data: torch.Tensor,
+        true_update: torch.Tensor,
+        iterations: int = 500,
+        lr: float = 0.1,
+        update_lr: float = 1e-3,
+        return_history: bool = False,
+        record_steps: List[int] | None = None,
+        loss_strategy: str = "cosine",
+    ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+        device = next(self.model.parameters()).device
+        original_data = original_data.to(device)
+        true_update = true_update.to(device)
+
+        b = original_data.shape[0]
+        dummy = (torch.randn(b, self.input_dim, device=device) * 0.1).requires_grad_(True)
+        opt = torch.optim.Adam([dummy], lr=lr)
+
+        history: Dict[int, torch.Tensor] = {}
+        record_steps = set(record_steps or [])
+        if 0 in record_steps:
+            history[0] = dummy.detach().cpu().clone()
+
+        loss_strategy = loss_strategy.lower().strip()
+
+        for step in range(1, iterations + 1):
+            opt.zero_grad()
+            update_vec = self._compute_update_vector(dummy, lr=update_lr)
+
+            if loss_strategy == "cosine":
+                update_loss = 1.0 - F.cosine_similarity(
+                    update_vec.unsqueeze(0), true_update.unsqueeze(0)
+                )
+            elif loss_strategy == "mse":
+                update_loss = F.mse_loss(update_vec, true_update)
+            else:
+                raise ValueError(f"Unknown loss_strategy: {loss_strategy}")
+
+            total_loss = update_loss
+            total_loss.backward()
+            opt.step()
+
+            if step in record_steps:
+                history[step] = dummy.detach().cpu().clone()
+
+        if return_history:
+            return dummy.detach().cpu(), history
+        return dummy.detach().cpu(), {}
 
 
 def clone_model(model: nn.Module) -> nn.Module:

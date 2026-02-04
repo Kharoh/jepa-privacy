@@ -440,8 +440,10 @@ class FederatedClient:
 
         update_vector = torch.cat(
             [
-                (local_model.state_dict()[k] - global_model.state_dict()[k]).flatten().cpu()
-                for k in global_model.state_dict()
+                (local_param.detach() - global_param.detach()).flatten().cpu()
+                for (_, local_param), (_, global_param) in zip(
+                    local_model.named_parameters(), global_model.named_parameters()
+                )
             ]
         )
 

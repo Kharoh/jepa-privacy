@@ -408,7 +408,7 @@ class UpdateInversionAttack:
         else:
             raise ValueError("Unknown model type for update inversion")
 
-        params = [p for p in model_copy.parameters() if p.requires_grad]
+        params = [p for _, p in model_copy.named_parameters() if p.requires_grad]
         grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True)
 
         updates = [(-lr * grad).flatten() for grad in grads if grad is not None]

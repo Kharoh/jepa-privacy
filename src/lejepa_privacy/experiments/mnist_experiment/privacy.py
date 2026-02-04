@@ -406,7 +406,12 @@ class UpdateInversionAttack:
             return aug
         return _normalize(dummy.clone())
 
-    def _compute_update_vector(self, dummy: torch.Tensor, lr: float) -> torch.Tensor:
+    def _compute_update_vector(
+        self,
+        dummy: torch.Tensor,
+        lr: float,
+        create_graph: bool = True,
+    ) -> torch.Tensor:
         model_copy = copy.deepcopy(self.model)
         model_copy.zero_grad(set_to_none=True)
         model_copy.train()
@@ -420,7 +425,7 @@ class UpdateInversionAttack:
             raise ValueError("Unknown model type for update inversion")
 
         params = [p for _, p in model_copy.named_parameters() if p.requires_grad]
-        grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True)
+        grads = torch.autograd.grad(loss, params, create_graph=create_graph, retain_graph=create_graph)
 
         updates = [(-lr * grad).flatten() for grad in grads if grad is not None]
         if not updates:
@@ -455,7 +460,7 @@ class UpdateInversionAttack:
 
         for step in range(1, iterations + 1):
             opt.zero_grad()
-            update_vec = self._compute_update_vector(dummy, lr=update_lr)
+            update_vec = self._compute_update_vector(dummy, lr=update_lr, create_graph=True)
 
             if loss_strategy == "cosine":
                 update_loss = 1.0 - F.cosine_similarity(
@@ -467,7 +472,9 @@ class UpdateInversionAttack:
                 raise ValueError(f"Unknown loss_strategy: {loss_strategy}")
 
             total_loss = update_loss
-            total_loss.backward()
+            grads = torch.autograd.grad(total_loss, dummy, retain_graph=False)
+            if grads and grads[0] is not None:
+                dummy.grad = grads[0]
             opt.step()
 
             if step in record_steps:

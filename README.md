@@ -26,7 +26,7 @@ communication/time tracking.
 The script downloads ImageNette automatically on first run.
 
 ## MNIST experiment protocol (summary)
-- **Federated mode:** FedAvg with model update sharing.
+- **Federated mode:** FedAvg with model update sharing by default; set `federated_strategy` to `gradients` to use averaged gradients (FedSGD-style).
 - **Attack signal:** update vectors (one-step SGD by default via `max_batches_per_epoch=1`).
 - **Augmentation alignment:** MAE uses the same augmentation family as LeJEPA (single view).
 - **Reconstruction target:** raw MNIST pixels in $[0,1]$ (optionally normalized if configured).

@@ -476,27 +476,54 @@ class FederatedServer:
         self.global_model = model
         self.round_history = []
 
-    def aggregate(self, client_updates: List[Dict]) -> None:
+    def aggregate(self, client_updates: List[Dict], strategy: str = "updates", lr: float | None = None) -> None:
         """
-        Federated averaging of client model updates.
+        Aggregate client updates using either FedAvg (model updates) or gradient averaging.
         """
-        with torch.no_grad():
-            avg_state = {}
-            for key in self.global_model.state_dict().keys():
-                stacked = []
-                for client in client_updates:
-                    tensor = client["model_state"][key]
-                    if not tensor.is_floating_point():
-                        tensor = tensor.to(torch.float32)
-                    stacked.append(tensor)
-                stacked = torch.stack(stacked)
-                avg = stacked.mean(dim=0)
-                ref = client_updates[0]["model_state"][key]
-                if not ref.is_floating_point():
-                    avg = avg.round().to(ref.dtype)
-                avg_state[key] = avg
+        strategy = strategy.lower().strip()
+        if strategy not in {"updates", "gradients"}:
+            raise ValueError(f"Unknown federated strategy: {strategy}")
 
-            self.global_model.load_state_dict(avg_state)
+        if strategy == "updates":
+            with torch.no_grad():
+                avg_state = {}
+                for key in self.global_model.state_dict().keys():
+                    stacked = []
+                    for client in client_updates:
+                        tensor = client["model_state"][key]
+                        if not tensor.is_floating_point():
+                            tensor = tensor.to(torch.float32)
+                        stacked.append(tensor)
+                    stacked = torch.stack(stacked)
+                    avg = stacked.mean(dim=0)
+                    ref = client_updates[0]["model_state"][key]
+                    if not ref.is_floating_point():
+                        avg = avg.round().to(ref.dtype)
+                    avg_state[key] = avg
+
+                self.global_model.load_state_dict(avg_state)
+            return
+
+        if lr is None:
+            raise ValueError("Learning rate is required for gradient aggregation")
+
+        device = next(self.global_model.parameters()).device
+        grads = [client["gradients"].to(device) for client in client_updates]
+        avg_grad = torch.stack(grads).mean(dim=0)
+
+        with torch.no_grad():
+            offset = 0
+            for param in self.global_model.parameters():
+                numel = param.numel()
+                grad_slice = avg_grad[offset : offset + numel].view_as(param)
+                if not grad_slice.is_floating_point():
+                    grad_slice = grad_slice.to(torch.float32)
+                if param.is_floating_point():
+                    param.add_(grad_slice, alpha=-lr)
+                else:
+                    updated = param.to(torch.float32).add(grad_slice, alpha=-lr)
+                    param.copy_(updated.round().to(param.dtype))
+                offset += numel
 
 
 def _build_results_dict() -> Dict[str, Dict[str, List[float]]]:
@@ -811,8 +838,20 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         logger.info("Round %s/%s", round_idx + 1, config.num_rounds)
         round_start = time.perf_counter()
 
-        lejepa_updates = [
-            client.local_train(
+        if config.clients_per_round is None or config.clients_per_round >= config.num_clients:
+            round_client_ids = list(range(config.num_clients))
+        else:
+            rng = np.random.default_rng(config.seed + round_idx)
+            round_client_ids = rng.choice(
+                config.num_clients,
+                size=config.clients_per_round,
+                replace=False,
+            ).tolist()
+
+        lejepa_updates_by_client = {}
+        for client_id in round_client_ids:
+            client = lejepa_clients[client_id]
+            lejepa_updates_by_client[client_id] = client.local_train(
                 lejepa_server.global_model,
                 epochs=config.local_epochs,
                 lr=config.learning_rate,
@@ -822,9 +861,12 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
             )
-            for client in lejepa_clients
-        ]
-        lejepa_server.aggregate(lejepa_updates)
+        lejepa_updates = list(lejepa_updates_by_client.values())
+        lejepa_server.aggregate(
+            lejepa_updates,
+            strategy=config.federated_strategy,
+            lr=config.learning_rate,
+        )
         lejepa_avg_loss = float(np.mean([update["loss"] for update in lejepa_updates]))
         results["lejepa"]["loss"].append(lejepa_avg_loss)
         results["lejepa"]["loss_rounds"].append(round_idx)
@@ -836,7 +878,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         results["lejepa"]["inv"].append(lejepa_avg_inv)
         results["lejepa"]["sigreg"].append(lejepa_avg_sigreg)
 
-        for client_id, update in enumerate(lejepa_updates):
+        for client_id, update in lejepa_updates_by_client.items():
             append_loss_log(
                 loss_log_path,
                 round_idx,
@@ -850,8 +892,10 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 },
             )
 
-        mae_updates = [
-            client.local_train(
+        mae_updates_by_client = {}
+        for client_id in round_client_ids:
+            client = mae_clients[client_id]
+            mae_updates_by_client[client_id] = client.local_train(
                 mae_server.global_model,
                 epochs=config.local_epochs,
                 lr=config.learning_rate,
@@ -861,14 +905,17 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
             )
-            for client in mae_clients
-        ]
-        mae_server.aggregate(mae_updates)
+        mae_updates = list(mae_updates_by_client.values())
+        mae_server.aggregate(
+            mae_updates,
+            strategy=config.federated_strategy,
+            lr=config.learning_rate,
+        )
         mae_avg_loss = float(np.mean([update["loss"] for update in mae_updates]))
         results["mae"]["loss"].append(mae_avg_loss)
         results["mae"]["loss_rounds"].append(round_idx)
 
-        for client_id, update in enumerate(mae_updates):
+        for client_id, update in mae_updates_by_client.items():
             append_loss_log(
                 loss_log_path,
                 round_idx,
@@ -881,7 +928,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         round_time = time.perf_counter() - round_start
         num_params = sum(p.numel() for p in lejepa_server.global_model.parameters())
         bytes_per_model = num_params * 4
-        comm_bytes = config.num_clients * bytes_per_model * 2
+        comm_bytes = len(round_client_ids) * bytes_per_model * 2
         results["system"]["comm_bytes"].append(float(comm_bytes))
         results["system"]["time_sec"].append(float(round_time))
         results["system"]["rounds"].append(round_idx)
@@ -928,8 +975,9 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         )
 
         if round_idx % config.eval_every == 0 or round_idx == config.num_rounds - 1:
-            max_clients = min(config.attack_eval_clients, config.num_clients)
-            client_indices = list(range(max_clients))
+            available_client_ids = list(lejepa_updates_by_client.keys())
+            max_clients = min(config.attack_eval_clients, len(available_client_ids))
+            client_indices = available_client_ids[:max_clients]
             strategies = [s.lower().strip() for s in config.attack_loss_strategies]
 
             for strategy in strategies:
@@ -946,16 +994,16 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                     strategy, {"rate": [], "rounds": []}
                 )
 
-            for model_key, updates, attacker in (
-                ("lejepa", lejepa_updates, lejepa_attacker),
-                ("mae", mae_updates, mae_attacker),
+            for model_key, updates_by_client, attacker in (
+                ("lejepa", lejepa_updates_by_client, lejepa_attacker),
+                ("mae", mae_updates_by_client, mae_attacker),
             ):
                 attacker_augmenter = attack_augmenter if model_key == "lejepa" else attack_mae_augmenter
                 for strategy in strategies:
                     metric_vals = {"mse": [], "psnr": [], "cosine": []}
                     success_vals = []
                     for client_idx in client_indices:
-                        update = updates[client_idx]
+                        update = updates_by_client[client_idx]
                         if config.attack_use_raw_data:
                             attack_input = update["raw_data"]
                             denorm_fn = None
@@ -1058,11 +1106,12 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         results[model_key]["cosine"].append(avg_cos)
                         results[model_key]["rounds"].append(round_idx)
 
+            baseline_update = lejepa_updates_by_client[client_indices[0]]
             baseline_input = (
-                lejepa_updates[client_indices[0]]["raw_data"]
+                baseline_update["raw_data"]
                 if config.attack_use_raw_data
                 else denormalize_mnist(
-                    lejepa_updates[client_indices[0]]["data"],
+                    baseline_update["data"],
                     config.normalize_mean,
                     config.normalize_std,
                 )

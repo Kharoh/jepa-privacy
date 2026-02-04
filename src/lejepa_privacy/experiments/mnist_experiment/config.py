@@ -93,6 +93,7 @@ class ExperimentConfig:
     dp_config: DPConfig = field(default_factory=DPConfig)
 
     align_augmentations: bool = True
+    federated_strategy: str = "updates"
     attack_on: str = "updates"
     attack_loss_strategies: List[str] = field(default_factory=lambda: ["cosine", "mse"])
     attack_eval_clients: int = 1

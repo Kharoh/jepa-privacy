@@ -68,7 +68,8 @@
     "apply_to_updates": true
   },
   "align_augmentations": true,
-  "attack_on": "updates",
+  "attack_on": "gradients",
+  "federated_strategy": "gradients",
   "attack_loss_strategies": ["cosine", "mse"],
   "attack_eval_clients": 3,
   "attack_eval_batches": 1,

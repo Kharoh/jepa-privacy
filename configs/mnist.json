@@ -9,6 +9,7 @@
   "samples_per_client": 15000,
   "dirichlet_alpha": 10.0,
   "num_rounds": 1000,
+  "clients_per_round": null,
   "num_views": 4,
   "lamb": 0.005,
   "use_cnn": false,

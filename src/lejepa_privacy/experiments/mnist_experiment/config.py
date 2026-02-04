@@ -31,6 +31,7 @@ class ExperimentConfig:
     samples_per_client: int = 15000
     dirichlet_alpha: float = 10.0
     num_rounds: int = 1000
+    clients_per_round: int | None = None
     num_views: int = 4
     lamb: float = 0.005
     use_cnn: bool = False

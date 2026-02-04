@@ -236,7 +236,8 @@ def compute_gradients_for_data(
         loss = model.reconstruction_loss(x)
 
     loss.backward()
-    grads = torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None])
+    grad_tensors = [p.grad for p in model.parameters() if p.grad is not None]
+    grads = torch.nn.utils.parameters_to_vector(grad_tensors)
     return grads.detach().cpu()
 
 
@@ -326,10 +327,37 @@ class FederatedClient:
         self.augmenter = augmenter
         self.device = device
         self.dp_config = dp_config
+        if self.labels is not None:
+            self.dataset = TensorDataset(self.data, self.labels)
+        else:
+            self.dataset = TensorDataset(self.data)
+        self._loader_cache: Dict[Tuple[int, int, bool], DataLoader] = {}
+        self._local_model: nn.Module | None = None
         gen_device = "cuda" if device.type == "cuda" else "cpu"
         self.dp_generator = torch.Generator(device=gen_device)
         seed = dp_config.seed if dp_config is not None else 42
         self.dp_generator.manual_seed(seed + client_id)
+
+    def _get_loader(
+        self,
+        batch_size: int,
+        num_workers: int,
+        pin_memory: bool,
+    ) -> DataLoader:
+        key = (batch_size, num_workers, pin_memory)
+        loader = self._loader_cache.get(key)
+        if loader is None:
+            persistent_workers = num_workers > 0
+            loader = DataLoader(
+                self.dataset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=persistent_workers,
+            )
+            self._loader_cache[key] = loader
+        return loader
 
     def local_train(
         self,
@@ -341,14 +369,21 @@ class FederatedClient:
         optimizer_name: str = "sgd",
         num_workers: int = 0,
         pin_memory: bool = False,
+        use_amp: bool = False,
     ) -> Dict:
         """
         Train locally and return gradients for privacy analysis.
         Gradients correspond to the last local update batch.
         """
         device = self.device
-        local_model = copy.deepcopy(global_model)
+        if self._local_model is None:
+            self._local_model = copy.deepcopy(global_model)
+            self._local_model.to(device)
+        else:
+            self._local_model.load_state_dict(global_model.state_dict())
+        local_model = self._local_model
         local_model.to(device)
+        local_model.train()
         optimizer_name = optimizer_name.lower().strip()
         if optimizer_name == "adam":
             optimizer = torch.optim.Adam(local_model.parameters(), lr=lr)
@@ -357,17 +392,11 @@ class FederatedClient:
         else:
             raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
-        if self.labels is not None:
-            dataset = TensorDataset(self.data, self.labels)
-        else:
-            dataset = TensorDataset(self.data)
-        loader = DataLoader(
-            dataset,
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-        )
+        pin_memory = bool(pin_memory and device.type == "cuda")
+        loader = self._get_loader(batch_size, num_workers, pin_memory)
+        max_batches_effective = len(loader) if max_batches is None else min(max_batches, len(loader))
+        last_batch_idx = max_batches_effective - 1
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type == "cuda")
 
         last_batch = None
         last_labels = None
@@ -377,10 +406,11 @@ class FederatedClient:
         last_inv = None
         last_sigreg = None
 
-        for _ in range(epochs):
+        for epoch_idx in range(epochs):
             for batch_idx, batch in enumerate(loader):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
+                is_last_batch = epoch_idx == epochs - 1 and batch_idx == last_batch_idx
                 if self.labels is not None:
                     x_batch, y_batch = batch
                     last_labels = y_batch
@@ -389,44 +419,66 @@ class FederatedClient:
                     last_labels = None
 
                 last_batch = x_batch
-                x_batch = x_batch.to(device)
+                x_batch = x_batch.to(device, non_blocking=pin_memory)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
-                if self.model_type == "lejepa":
-                    if self.augmenter is None:
-                        raise ValueError("augmenter is required for LeJEPA training")
-                    x_views = self.augmenter(x_batch)
-                    loss_dict = local_model.compute_loss(x_views)
-                    loss = loss_dict["total"]
-                    last_inv = float(loss_dict["inv"].item())
-                    last_sigreg = float(loss_dict["sigreg"].item())
-                    last_input = x_views.detach()
-                else:
-                    if self.augmenter is not None:
-                        x_aug = self.augmenter(x_batch)
+                with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
+                    if self.model_type == "lejepa":
+                        if self.augmenter is None:
+                            raise ValueError("augmenter is required for LeJEPA training")
+                        x_views = self.augmenter(x_batch)
+                        loss_dict = local_model.compute_loss(x_views)
+                        loss = loss_dict["total"]
+                        last_inv = float(loss_dict["inv"].item())
+                        last_sigreg = float(loss_dict["sigreg"].item())
+                        last_input = x_views.detach()
                     else:
-                        x_aug = x_batch
-                    if x_aug.dim() == 3:
-                        x_aug = x_aug[:, 0, :]
-                    loss = local_model.reconstruction_loss(x_aug)
-                    last_input = x_aug.detach()
-                    last_inv = None
-                    last_sigreg = None
+                        if self.augmenter is not None:
+                            x_aug = self.augmenter(x_batch)
+                        else:
+                            x_aug = x_batch
+                        if x_aug.dim() == 3:
+                            x_aug = x_aug[:, 0, :]
+                        loss = local_model.reconstruction_loss(x_aug)
+                        last_input = x_aug.detach()
+                        last_inv = None
+                        last_sigreg = None
 
-                loss.backward()
-
-                flat_grad = torch.cat(
-                    [p.grad.flatten() for p in local_model.parameters() if p.grad is not None]
-                ).detach()
-
-                if self.dp_config is not None and self.dp_config.enabled and self.dp_config.apply_to_gradients:
-                    flat_grad, _ = apply_dp_to_vector(flat_grad, self.dp_config, self.dp_generator)
-
-                optimizer.step()
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    if is_last_batch:
+                        scaler.unscale_(optimizer)
+                        grad_tensors = [p.grad for p in local_model.parameters() if p.grad is not None]
+                        flat_grad = torch.nn.utils.parameters_to_vector(grad_tensors).detach()
+                        if (
+                            self.dp_config is not None
+                            and self.dp_config.enabled
+                            and self.dp_config.apply_to_gradients
+                        ):
+                            flat_grad, _ = apply_dp_to_vector(
+                                flat_grad, self.dp_config, self.dp_generator
+                            )
+                        last_grad = flat_grad
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    if is_last_batch:
+                        grad_tensors = [p.grad for p in local_model.parameters() if p.grad is not None]
+                        flat_grad = torch.nn.utils.parameters_to_vector(grad_tensors).detach()
+                        if (
+                            self.dp_config is not None
+                            and self.dp_config.enabled
+                            and self.dp_config.apply_to_gradients
+                        ):
+                            flat_grad, _ = apply_dp_to_vector(
+                                flat_grad, self.dp_config, self.dp_generator
+                            )
+                        last_grad = flat_grad
+                    optimizer.step()
 
                 last_loss = loss
-                last_grad = flat_grad
 
         if last_batch is None or last_grad is None:
             raise RuntimeError("No batches processed during local training")
@@ -446,14 +498,13 @@ class FederatedClient:
         else:
             dp_state = local_model.state_dict()
 
-        update_vector = torch.cat(
-            [
-                (local_param.detach() - global_param.detach()).flatten().cpu()
-                for (_, local_param), (_, global_param) in zip(
-                    local_model.named_parameters(), global_model.named_parameters()
-                )
-            ]
-        )
+        delta_params = [
+            (local_param.detach() - global_param.detach())
+            for (_, local_param), (_, global_param) in zip(
+                local_model.named_parameters(), global_model.named_parameters()
+            )
+        ]
+        update_vector = torch.nn.utils.parameters_to_vector(delta_params).cpu()
 
         return {
             "gradients": last_grad.cpu(),
@@ -708,6 +759,13 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         )
     lejepa_model.to(device)
     mae_model.to(device)
+    if config.use_torch_compile and hasattr(torch, "compile"):
+        try:
+            lejepa_model = torch.compile(lejepa_model)
+            mae_model = torch.compile(mae_model)
+            logger.info("Torch compile enabled for models")
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Torch compile failed, continuing without it: %s", exc)
     logger.info("LeJEPA: proj_dim=%s, lambda=%s, cnn=%s, vit=%s", config.proj_dim, config.lamb, config.use_cnn, config.use_vit)
     logger.info("MAE: latent_dim=%s, cnn=%s, vit=%s", config.emb_dim, config.use_cnn, config.use_vit)
 
@@ -860,6 +918,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 optimizer_name=config.optimizer,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
+                use_amp=config.use_amp,
             )
         lejepa_updates = list(lejepa_updates_by_client.values())
         lejepa_server.aggregate(
@@ -904,6 +963,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 optimizer_name=config.optimizer,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
+                use_amp=config.use_amp,
             )
         mae_updates = list(mae_updates_by_client.values())
         mae_server.aggregate(

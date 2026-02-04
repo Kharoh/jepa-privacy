@@ -48,9 +48,11 @@ class ExperimentConfig:
     max_batches_per_epoch: int | None = None
     optimizer: str = "sgd"
     learning_rate: float = 1e-3
-    data_loader_num_workers: int = 0
+    data_loader_num_workers: int = 2
     data_loader_pin_memory: bool = True
     global_batch_size: int = 256
+    use_amp: bool = True
+    use_torch_compile: bool = False
 
     normalize_mean: float = 0.1307
     normalize_std: float = 0.3081

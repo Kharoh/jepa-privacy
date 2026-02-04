@@ -1,7 +1,0 @@
-torch
-torchvision
-matplotlib
-numpy
-timm
-datasets
-huggingface-hub

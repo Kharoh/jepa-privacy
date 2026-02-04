@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 import random
 from typing import Optional
@@ -19,6 +20,8 @@ def set_seed(seed: int, deterministic: bool = True) -> None:
         torch.cuda.manual_seed_all(seed)
 
     if deterministic:
+        if torch.cuda.is_available():
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         try:

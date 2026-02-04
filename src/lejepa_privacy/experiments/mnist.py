@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import numpy as np
 import timm
 import torch
@@ -1281,16 +1282,30 @@ def plot_tsne_latents(latents: torch.Tensor, labels: torch.Tensor, save_path: st
     embedding = tsne.fit_transform(latents.numpy())
 
     fig, ax = plt.subplots(figsize=(6, 5))
+    cmap = plt.get_cmap("tab10")
     scatter = ax.scatter(
         embedding[:, 0],
         embedding[:, 1],
         c=labels.numpy(),
-        cmap="tab10",
+        cmap=cmap,
         alpha=0.8,
         s=18,
     )
+    unique_labels = torch.unique(labels).tolist()
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="",
+            color=cmap(int(label) % cmap.N),
+            label=str(int(label)),
+            markersize=6,
+        )
+        for label in unique_labels
+    ]
     legend = ax.legend(
-        *scatter.legend_elements(),
+        handles=handles,
         title="Class",
         bbox_to_anchor=(1.05, 1),
         loc="upper left",

@@ -384,12 +384,12 @@ class UpdateInversionAttack:
             if dummy.dim() == 2:
                 if self.view_augmenter is None:
                     raise ValueError("view_augmenter required for LeJEPA update inversion")
-                return self.view_augmenter(dummy)
+                return self.view_augmenter(dummy.clone())
             return dummy
         if dummy.dim() == 3:
             return dummy[:, 0, :]
         if self.view_augmenter is not None and dummy.dim() == 2:
-            aug = self.view_augmenter(dummy)
+            aug = self.view_augmenter(dummy.clone())
             if aug.dim() == 3:
                 return aug[:, 0, :]
             return aug
@@ -408,14 +408,10 @@ class UpdateInversionAttack:
         else:
             raise ValueError("Unknown model type for update inversion")
 
-        loss.backward()
+        params = [p for p in model_copy.parameters() if p.requires_grad]
+        grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True)
 
-        updates = []
-        with torch.no_grad():
-            for param in model_copy.parameters():
-                if param.grad is None:
-                    continue
-                updates.append((-lr * param.grad).flatten())
+        updates = [(-lr * grad).flatten() for grad in grads if grad is not None]
         if not updates:
             raise RuntimeError("No gradients found for update inversion")
         return torch.cat(updates)

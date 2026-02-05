@@ -229,6 +229,8 @@ class GradientInversionAttack:
         return_history: bool = False,
         record_steps: List[int] | None = None,
         loss_strategy: str = "cosine",
+        num_layers: int | None = None,
+        tv_weight: float | None = None,
     ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
         """
         Reconstruct data from gradients using optimization.
@@ -242,7 +244,8 @@ class GradientInversionAttack:
 
         opt = torch.optim.Adam([dummy], lr=lr)
 
-        tv_weight = 1e-4
+        if tv_weight is None:
+            tv_weight = 1e-4
 
         true_grad = true_grad.detach()
 
@@ -265,6 +268,8 @@ class GradientInversionAttack:
                 raise ValueError("Unknown model type for gradient inversion")
 
             params = [p for p in self.model.parameters() if p.requires_grad]
+            if num_layers is not None and num_layers > 0:
+                params = params[:num_layers]
             grads = torch.autograd.grad(
                 loss,
                 params,
@@ -276,6 +281,11 @@ class GradientInversionAttack:
             if len(grads_flat) == 0:
                 break
             dummy_grad = torch.cat(grads_flat)
+
+            if dummy_grad.numel() != true_grad.numel():
+                slice_len = min(dummy_grad.numel(), true_grad.numel())
+                dummy_grad = dummy_grad[:slice_len]
+                true_grad = true_grad[:slice_len]
 
             if loss_strategy == "cosine":
                 grad_loss = 1.0 - F.cosine_similarity(
@@ -411,6 +421,7 @@ class UpdateInversionAttack:
         dummy: torch.Tensor,
         lr: float,
         create_graph: bool = True,
+        num_layers: int | None = None,
     ) -> torch.Tensor:
         model_copy = copy.deepcopy(self.model)
         model_copy.zero_grad(set_to_none=True)
@@ -425,6 +436,8 @@ class UpdateInversionAttack:
             raise ValueError("Unknown model type for update inversion")
 
         params = [p for _, p in model_copy.named_parameters() if p.requires_grad]
+        if num_layers is not None and num_layers > 0:
+            params = params[:num_layers]
         grads = torch.autograd.grad(loss, params, create_graph=create_graph, retain_graph=create_graph)
 
         updates = [(-lr * grad).flatten() for grad in grads if grad is not None]
@@ -442,6 +455,7 @@ class UpdateInversionAttack:
         return_history: bool = False,
         record_steps: List[int] | None = None,
         loss_strategy: str = "cosine",
+        num_layers: int | None = None,
     ) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
         device = next(self.model.parameters()).device
         original_data = original_data.to(device)
@@ -460,7 +474,17 @@ class UpdateInversionAttack:
 
         for step in range(1, iterations + 1):
             opt.zero_grad()
-            update_vec = self._compute_update_vector(dummy, lr=update_lr, create_graph=True)
+            update_vec = self._compute_update_vector(
+                dummy,
+                lr=update_lr,
+                create_graph=True,
+                num_layers=num_layers,
+            )
+
+            if update_vec.numel() != true_update.numel():
+                slice_len = min(update_vec.numel(), true_update.numel())
+                update_vec = update_vec[:slice_len]
+                true_update = true_update[:slice_len]
 
             if loss_strategy == "cosine":
                 update_loss = 1.0 - F.cosine_similarity(

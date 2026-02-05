@@ -114,6 +114,11 @@ class ExperimentConfig:
     attack_round_max_batches: int | None = 1
     attack_round_clients: int = 1
     attack_round_disable_augmentations: bool = True
+    attack_round_num_layers: int | None = None
+    attack_round_tv_weight: float | None = None
+    attack_round_iterations: int | None = None
+    attack_round_plot_steps: List[int] = field(default_factory=list)
+    attack_round_plot_iterations: int | None = None
 
     val_tsne_samples: int = 600
     probe_train_samples: int = 2000

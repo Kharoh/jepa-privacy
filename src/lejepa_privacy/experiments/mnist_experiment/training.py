@@ -220,6 +220,7 @@ def compute_gradients_for_data(
     model_type: str,
     num_views: int,
     augmenter: ViewAugmenter | IdentityAugmenter,
+    max_layers: int | None = None,
 ) -> torch.Tensor:
     """Compute flattened gradients for a batch without updating model weights."""
     device = next(model.parameters()).device
@@ -237,8 +238,25 @@ def compute_gradients_for_data(
 
     loss.backward()
     grad_tensors = [p.grad for p in model.parameters() if p.grad is not None]
+    if max_layers is not None and max_layers > 0:
+        grad_tensors = grad_tensors[:max_layers]
     grads = torch.nn.utils.parameters_to_vector(grad_tensors)
     return grads.detach().cpu()
+
+
+def truncate_vector_to_layers(
+    vector: torch.Tensor,
+    model: nn.Module,
+    num_layers: int | None,
+) -> torch.Tensor:
+    if num_layers is None or num_layers <= 0:
+        return vector
+    numel = 0
+    for idx, param in enumerate(model.parameters()):
+        if idx >= num_layers:
+            break
+        numel += param.numel()
+    return vector[:numel]
 
 
 def initialize_loss_log(log_path: Path) -> None:
@@ -931,6 +949,23 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         disable_augmentations = bool(
             is_attack_round and config.attack_round_disable_augmentations
         )
+        attack_num_layers = config.attack_round_num_layers if is_attack_round else None
+        attack_tv_weight = config.attack_round_tv_weight if is_attack_round else None
+        attack_iterations = (
+            config.attack_round_iterations
+            if is_attack_round and config.attack_round_iterations is not None
+            else config.attack_iterations
+        )
+        attack_plot_steps_source = (
+            config.attack_round_plot_steps
+            if is_attack_round and config.attack_round_plot_steps
+            else config.plot_steps
+        )
+        attack_plot_iterations_cap = (
+            config.attack_round_plot_iterations
+            if is_attack_round and config.attack_round_plot_iterations is not None
+            else config.attack_plot_iterations
+        )
 
         if round_clients_per_round is None or round_clients_per_round >= config.num_clients:
             round_client_ids = list(range(config.num_clients))
@@ -1139,43 +1174,66 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                             attack_batches.append((extra_batch, None))
 
                         for attack_input, update_obj in attack_batches:
+                            model_ref = (
+                                lejepa_server.global_model
+                                if model_key == "lejepa"
+                                else mae_server.global_model
+                            )
                             if config.attack_on == "gradients":
                                 true_signal = (
                                     update_obj["gradients"]
                                     if update_obj is not None
                                     else compute_gradients_for_data(
-                                        lejepa_server.global_model if model_key == "lejepa" else mae_server.global_model,
+                                        model_ref,
                                         attack_input,
                                         model_type=model_key,
                                         num_views=config.num_views if model_key == "lejepa" else 1,
                                         augmenter=attacker_augmenter,
+                                        max_layers=attack_num_layers,
                                     )
                                 )
+                                if update_obj is not None and attack_num_layers:
+                                    true_signal = truncate_vector_to_layers(
+                                        true_signal,
+                                        model_ref,
+                                        attack_num_layers,
+                                    )
                             else:
                                 true_signal = (
                                     update_obj["update_vector"]
                                     if update_obj is not None
                                     else attacker._compute_update_vector(
-                                        attack_input.to(device), lr=config.learning_rate
+                                        attack_input.to(device),
+                                        lr=config.learning_rate,
+                                        num_layers=attack_num_layers,
                                     )
                                 )
+                                if update_obj is not None and attack_num_layers:
+                                    true_signal = truncate_vector_to_layers(
+                                        true_signal,
+                                        model_ref,
+                                        attack_num_layers,
+                                    )
 
                             if config.attack_on == "gradients":
                                 recon, _ = attacker.attack(
                                     attack_input,
                                     true_signal,
                                     lr=0.05,
-                                    iterations=config.attack_iterations,
+                                    iterations=attack_iterations,
                                     loss_strategy=strategy,
+                                    num_layers=attack_num_layers,
+                                    tv_weight=attack_tv_weight,
                                 )
                             else:
                                 recon, _ = attacker.attack(
                                     attack_input,
                                     true_signal,
                                     lr=0.05,
-                                    iterations=config.attack_iterations,
+                                    iterations=attack_iterations,
                                     loss_strategy=strategy,
                                     update_lr=config.learning_rate,
+                                    num_layers=attack_num_layers,
                                 )
 
                             metrics = metrics_helper.compute_metrics(
@@ -1285,26 +1343,36 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                             model_type=model_key,
                             num_views=config.num_views if model_key == "lejepa" else 1,
                             augmenter=augmenter,
+                            max_layers=attack_num_layers,
                         )
+                        if attack_num_layers:
+                            signal = truncate_vector_to_layers(signal, model, attack_num_layers)
                     else:
                         signal = attacker._compute_update_vector(
-                            plot_samples.to(device), lr=config.learning_rate
+                            plot_samples.to(device),
+                            lr=config.learning_rate,
+                            num_layers=attack_num_layers,
                         )
+                        if attack_num_layers:
+                            signal = truncate_vector_to_layers(signal, model, attack_num_layers)
 
                     if config.attack_on == "gradients":
                         recon, _ = attacker.attack(
                             plot_samples,
                             signal,
-                            iterations=200,
+                            iterations=attack_iterations,
                             loss_strategy=primary_strategy,
+                            num_layers=attack_num_layers,
+                            tv_weight=attack_tv_weight,
                         )
                     else:
                         recon, _ = attacker.attack(
                             plot_samples,
                             signal,
-                            iterations=200,
+                            iterations=attack_iterations,
                             loss_strategy=primary_strategy,
                             update_lr=config.learning_rate,
+                            num_layers=attack_num_layers,
                         )
 
                     metrics = metrics_helper.compute_metrics(
@@ -1350,8 +1418,15 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
 
         if (config.plot_rounds and round_idx in config.plot_rounds) or is_attack_round:
             logger.info("[Plotting] Reconstruction steps at round %s", round_idx + 1)
-            plot_iterations = min(max(config.plot_steps), config.attack_plot_iterations)
-            plot_steps = [step for step in config.plot_steps if step <= plot_iterations]
+            if attack_plot_steps_source:
+                max_step = max(attack_plot_steps_source)
+            else:
+                max_step = attack_iterations
+            if attack_plot_iterations_cap is None:
+                plot_iterations = max_step
+            else:
+                plot_iterations = min(max_step, attack_plot_iterations_cap)
+            plot_steps = [step for step in attack_plot_steps_source if step <= plot_iterations]
             if not plot_steps:
                 plot_steps = [plot_iterations]
             class_samples = sample_class_images(
@@ -1380,6 +1455,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         model_type="lejepa",
                         num_views=config.num_views,
                         augmenter=plot_lejepa_aug,
+                        max_layers=attack_num_layers,
                     )
                     mae_signal = compute_gradients_for_data(
                         mae_server.global_model,
@@ -1387,14 +1463,33 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         model_type="mae",
                         num_views=1,
                         augmenter=plot_mae_aug,
+                        max_layers=attack_num_layers,
                     )
+                    if attack_num_layers:
+                        lejepa_signal = truncate_vector_to_layers(
+                            lejepa_signal, lejepa_server.global_model, attack_num_layers
+                        )
+                        mae_signal = truncate_vector_to_layers(
+                            mae_signal, mae_server.global_model, attack_num_layers
+                        )
                 else:
                     lejepa_signal = lejepa_attacker._compute_update_vector(
-                        samples.to(device), lr=config.learning_rate
+                        samples.to(device),
+                        lr=config.learning_rate,
+                        num_layers=attack_num_layers,
                     )
                     mae_signal = mae_attacker._compute_update_vector(
-                        samples.to(device), lr=config.learning_rate
+                        samples.to(device),
+                        lr=config.learning_rate,
+                        num_layers=attack_num_layers,
                     )
+                    if attack_num_layers:
+                        lejepa_signal = truncate_vector_to_layers(
+                            lejepa_signal, lejepa_server.global_model, attack_num_layers
+                        )
+                        mae_signal = truncate_vector_to_layers(
+                            mae_signal, mae_server.global_model, attack_num_layers
+                        )
 
                 if config.attack_on == "gradients":
                     lejepa_recon, lejepa_history = lejepa_attacker.attack(
@@ -1403,6 +1498,8 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         iterations=plot_iterations,
                         return_history=True,
                         record_steps=plot_steps,
+                        num_layers=attack_num_layers,
+                        tv_weight=attack_tv_weight,
                     )
                     mae_recon, mae_history = mae_attacker.attack(
                         samples,
@@ -1410,6 +1507,8 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         iterations=plot_iterations,
                         return_history=True,
                         record_steps=plot_steps,
+                        num_layers=attack_num_layers,
+                        tv_weight=attack_tv_weight,
                     )
                 else:
                     lejepa_recon, lejepa_history = lejepa_attacker.attack(
@@ -1419,6 +1518,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         return_history=True,
                         record_steps=plot_steps,
                         update_lr=config.learning_rate,
+                        num_layers=attack_num_layers,
                     )
                     mae_recon, mae_history = mae_attacker.attack(
                         samples,
@@ -1427,6 +1527,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         return_history=True,
                         record_steps=plot_steps,
                         update_lr=config.learning_rate,
+                        num_layers=attack_num_layers,
                     )
 
                 histories["lejepa"][cls] = lejepa_history

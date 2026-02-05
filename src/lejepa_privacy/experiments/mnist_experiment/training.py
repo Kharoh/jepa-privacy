@@ -720,7 +720,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         total_samples=total_samples,
         alpha=config.dirichlet_alpha,
         seed=config.seed,
-        data_dir="data",
+        data_dir="/Data/lucas.jung/mnist",
         image_shape=config.image_shape,
     )
     all_train_data = torch.cat(client_data)
@@ -887,8 +887,8 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
     val_dataset = None
     test_dataset = None
     if config.plot_rounds:
-        val_dataset = datasets.MNIST(root="data", train=False, download=True, transform=mnist_transform)
-        test_dataset = datasets.MNIST(root="data", train=False, download=True, transform=mnist_transform)
+        val_dataset = datasets.MNIST(root="/Data/lucas.jung/mnist", train=False, download=True, transform=mnist_transform)
+        test_dataset = datasets.MNIST(root="/Data/lucas.jung/mnist", train=False, download=True, transform=mnist_transform)
 
     start_round = 0
     if config.resume_from:
@@ -1461,7 +1461,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 logger.info("[Plotting] t-SNE embeddings for validation samples")
                 if val_dataset is None:
                     val_dataset = datasets.MNIST(
-                        root="data", train=False, download=True, transform=mnist_transform
+                        root="/Data/lucas.jung/mnist", train=False, download=True, transform=mnist_transform
                     )
                 val_data, val_labels = sample_mnist_dataset(
                     val_dataset, max_samples=config.val_tsne_samples
@@ -1496,7 +1496,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
 
             if test_dataset is None:
                 test_dataset = datasets.MNIST(
-                    root="data", train=False, download=True, transform=mnist_transform
+                    root="/Data/lucas.jung/MNIST", train=False, download=True, transform=mnist_transform
                 )
             test_data, test_labels = sample_mnist_dataset(
                 test_dataset, max_samples=config.probe_test_samples

@@ -33,7 +33,7 @@ def load_mnist_non_iid(
     total_samples: int,
     alpha: float = 0.5,
     seed: int = 42,
-    data_dir: str = "data",
+    data_dir: str = "/Data/lucas.jung/mnist",
     image_shape: Tuple[int, int, int] = (1, 28, 28),
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """

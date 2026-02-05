@@ -108,6 +108,13 @@ class ExperimentConfig:
     attack_deterministic_augment: bool = True
     attack_seed: int = 123
 
+    attack_rounds: List[int] = field(default_factory=list)
+    attack_round_batch_size: int = 16
+    attack_round_local_epochs: int = 1
+    attack_round_max_batches: int | None = 1
+    attack_round_clients: int = 1
+    attack_round_disable_augmentations: bool = True
+
     val_tsne_samples: int = 600
     probe_train_samples: int = 2000
     probe_test_samples: int = 1000

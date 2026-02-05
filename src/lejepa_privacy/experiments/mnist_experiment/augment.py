@@ -157,3 +157,14 @@ class IdentityAugmenter:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return normalize_mnist(x, self.normalize_mean, self.normalize_std)
+
+
+class IdentityViewAugmenter:
+    def __init__(self, num_views: int, normalize_mean: float, normalize_std: float):
+        self.num_views = num_views
+        self.normalize_mean = normalize_mean
+        self.normalize_std = normalize_std
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        normalized = normalize_mnist(x, self.normalize_mean, self.normalize_std)
+        return normalized.unsqueeze(1).repeat(1, self.num_views, 1)

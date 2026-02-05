@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torchvision import datasets
 
-from .augment import IdentityAugmenter, ViewAugmenter
+from .augment import IdentityAugmenter, IdentityViewAugmenter, ViewAugmenter
 from .config import ExperimentConfig
 from .data import (
     create_mnist_transform,
@@ -370,6 +370,7 @@ class FederatedClient:
         num_workers: int = 0,
         pin_memory: bool = False,
         use_amp: bool = False,
+        augmenter_override: ViewAugmenter | IdentityAugmenter | IdentityViewAugmenter | None = None,
     ) -> Dict:
         """
         Train locally and return gradients for privacy analysis.
@@ -406,6 +407,8 @@ class FederatedClient:
         last_inv = None
         last_sigreg = None
 
+        augmenter = augmenter_override if augmenter_override is not None else self.augmenter
+
         for epoch_idx in range(epochs):
             for batch_idx, batch in enumerate(loader):
                 if max_batches is not None and batch_idx >= max_batches:
@@ -425,17 +428,17 @@ class FederatedClient:
 
                 with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
                     if self.model_type == "lejepa":
-                        if self.augmenter is None:
+                        if augmenter is None:
                             raise ValueError("augmenter is required for LeJEPA training")
-                        x_views = self.augmenter(x_batch)
+                        x_views = augmenter(x_batch)
                         loss_dict = local_model.compute_loss(x_views)
                         loss = loss_dict["total"]
                         last_inv = float(loss_dict["inv"].item())
                         last_sigreg = float(loss_dict["sigreg"].item())
                         last_input = x_views.detach()
                     else:
-                        if self.augmenter is not None:
-                            x_aug = self.augmenter(x_batch)
+                        if augmenter is not None:
+                            x_aug = augmenter(x_batch)
                         else:
                             x_aug = x_batch
                         if x_aug.dim() == 3:
@@ -796,6 +799,11 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
     else:
         mae_augmenter = IdentityAugmenter(config.normalize_mean, config.normalize_std)
 
+    identity_view_augmenter = IdentityViewAugmenter(
+        config.num_views, config.normalize_mean, config.normalize_std
+    )
+    identity_mae_augmenter = IdentityAugmenter(config.normalize_mean, config.normalize_std)
+
     attack_augmenter = ViewAugmenter(
         num_views=config.num_views,
         image_shape=config.image_shape,
@@ -890,19 +898,47 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             logger.info("Resumed from checkpoint %s (round %s)", checkpoint_file, start_round)
 
     last_reconstructions: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    attack_rounds = set(config.attack_rounds)
 
     logger.info("[3] Running federated training...")
     for round_idx in range(start_round, config.num_rounds):
         logger.info("Round %s/%s", round_idx + 1, config.num_rounds)
         round_start = time.perf_counter()
 
-        if config.clients_per_round is None or config.clients_per_round >= config.num_clients:
+        is_attack_round = round_idx in attack_rounds
+        if is_attack_round:
+            logger.info(
+                "Attack round overrides enabled: batch_size=%s, local_epochs=%s, max_batches=%s, clients=%s, disable_augmentations=%s",
+                config.attack_round_batch_size,
+                config.attack_round_local_epochs,
+                config.attack_round_max_batches,
+                config.attack_round_clients,
+                config.attack_round_disable_augmentations,
+            )
+
+        round_batch_size = (
+            config.attack_round_batch_size if is_attack_round else config.batch_size
+        )
+        round_local_epochs = (
+            config.attack_round_local_epochs if is_attack_round else config.local_epochs
+        )
+        round_max_batches = (
+            config.attack_round_max_batches if is_attack_round else config.max_batches_per_epoch
+        )
+        round_clients_per_round = (
+            config.attack_round_clients if is_attack_round else config.clients_per_round
+        )
+        disable_augmentations = bool(
+            is_attack_round and config.attack_round_disable_augmentations
+        )
+
+        if round_clients_per_round is None or round_clients_per_round >= config.num_clients:
             round_client_ids = list(range(config.num_clients))
         else:
             rng = np.random.default_rng(config.seed + round_idx)
             round_client_ids = rng.choice(
                 config.num_clients,
-                size=config.clients_per_round,
+                size=round_clients_per_round,
                 replace=False,
             ).tolist()
 
@@ -911,14 +947,15 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             client = lejepa_clients[client_id]
             lejepa_updates_by_client[client_id] = client.local_train(
                 lejepa_server.global_model,
-                epochs=config.local_epochs,
+                epochs=round_local_epochs,
                 lr=config.learning_rate,
-                batch_size=config.batch_size,
-                max_batches=config.max_batches_per_epoch,
+                batch_size=round_batch_size,
+                max_batches=round_max_batches,
                 optimizer_name=config.optimizer,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
                 use_amp=config.use_amp,
+                augmenter_override=identity_view_augmenter if disable_augmentations else None,
             )
         lejepa_updates = list(lejepa_updates_by_client.values())
         lejepa_server.aggregate(
@@ -956,14 +993,15 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             client = mae_clients[client_id]
             mae_updates_by_client[client_id] = client.local_train(
                 mae_server.global_model,
-                epochs=config.local_epochs,
+                epochs=round_local_epochs,
                 lr=config.learning_rate,
-                batch_size=config.batch_size,
-                max_batches=config.max_batches_per_epoch,
+                batch_size=round_batch_size,
+                max_batches=round_max_batches,
                 optimizer_name=config.optimizer,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
                 use_amp=config.use_amp,
+                augmenter_override=identity_mae_augmenter if disable_augmentations else None,
             )
         mae_updates = list(mae_updates_by_client.values())
         mae_server.aggregate(
@@ -1034,11 +1072,17 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             mae_global_losses,
         )
 
-        if round_idx % config.eval_every == 0 or round_idx == config.num_rounds - 1:
+        if (
+            round_idx % config.eval_every == 0
+            or round_idx == config.num_rounds - 1
+            or is_attack_round
+        ):
             available_client_ids = list(lejepa_updates_by_client.keys())
             max_clients = min(config.attack_eval_clients, len(available_client_ids))
             client_indices = available_client_ids[:max_clients]
             strategies = [s.lower().strip() for s in config.attack_loss_strategies]
+            attack_batch_size = round_batch_size if is_attack_round else config.batch_size
+            attack_round_reconstructions: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
             for strategy in strategies:
                 results["lejepa"]["attack"].setdefault(
@@ -1058,7 +1102,14 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 ("lejepa", lejepa_updates_by_client, lejepa_attacker),
                 ("mae", mae_updates_by_client, mae_attacker),
             ):
-                attacker_augmenter = attack_augmenter if model_key == "lejepa" else attack_mae_augmenter
+                if disable_augmentations:
+                    attacker_augmenter = (
+                        identity_view_augmenter if model_key == "lejepa" else identity_mae_augmenter
+                    )
+                else:
+                    attacker_augmenter = (
+                        attack_augmenter if model_key == "lejepa" else attack_mae_augmenter
+                    )
                 for strategy in strategies:
                     metric_vals = {"mse": [], "psnr": [], "cosine": []}
                     success_vals = []
@@ -1078,7 +1129,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         for extra_idx in range(extra_batches):
                             extra_batch = sample_tensor_batch(
                                 client_data[client_idx],
-                                max_samples=config.batch_size,
+                                max_samples=attack_batch_size,
                                 seed=round_idx + client_idx + extra_idx + 1,
                             )
                             if not config.attack_use_raw_data:
@@ -1140,13 +1191,17 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                             )
 
                             if (
-                                round_idx == config.num_rounds - 1
+                                (round_idx == config.num_rounds - 1 or is_attack_round)
                                 and strategy == strategies[0]
                                 and update_obj is not None
                             ):
                                 last_reconstructions[f"{model_key}_attack"] = (
                                     attack_input.detach(), recon.detach()
                                 )
+                                if is_attack_round:
+                                    attack_round_reconstructions[model_key] = (
+                                        attack_input.detach(), recon.detach()
+                                    )
 
                     avg_mse = float(np.mean(metric_vals["mse"]))
                     avg_psnr = float(np.mean(metric_vals["psnr"]))
@@ -1213,9 +1268,15 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             )
             for cls, samples in class_samples.items():
                 plot_samples = samples.clone()
+                plot_lejepa_aug = (
+                    identity_view_augmenter if disable_augmentations else lejepa_augmenter
+                )
+                plot_mae_aug = (
+                    identity_mae_augmenter if disable_augmentations else mae_augmenter
+                )
                 for model_key, model, attacker, augmenter in (
-                    ("lejepa", lejepa_server.global_model, lejepa_attacker, lejepa_augmenter),
-                    ("mae", mae_server.global_model, mae_attacker, mae_augmenter),
+                    ("lejepa", lejepa_server.global_model, lejepa_attacker, plot_lejepa_aug),
+                    ("mae", mae_server.global_model, mae_attacker, plot_mae_aug),
                 ):
                     if config.attack_on == "gradients":
                         signal = compute_gradients_for_data(
@@ -1262,7 +1323,32 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                         success,
                     )
 
-        if config.plot_rounds and round_idx in config.plot_rounds:
+            if is_attack_round and "lejepa" in attack_round_reconstructions and "mae" in attack_round_reconstructions:
+                logger.info("[Attack Round] Saving reconstruction grids for round %s", round_idx + 1)
+                lejepa_orig, lejepa_recon = attack_round_reconstructions["lejepa"]
+                mae_orig, mae_recon = attack_round_reconstructions["mae"]
+                plot_reconstructions(
+                    lejepa_orig,
+                    lejepa_recon,
+                    save_path=str(output_dir / f"lejepa_reconstructions_round{round_idx + 1}.png"),
+                    title=f"LeJEPA Update Inversion (Round {round_idx + 1})",
+                    image_shape=config.image_shape,
+                    normalize_mean=config.normalize_mean,
+                    normalize_std=config.normalize_std,
+                    denormalize=not config.attack_use_raw_data,
+                )
+                plot_reconstructions(
+                    mae_orig,
+                    mae_recon,
+                    save_path=str(output_dir / f"mae_reconstructions_round{round_idx + 1}.png"),
+                    title=f"MAE Update Inversion (Round {round_idx + 1})",
+                    image_shape=config.image_shape,
+                    normalize_mean=config.normalize_mean,
+                    normalize_std=config.normalize_std,
+                    denormalize=not config.attack_use_raw_data,
+                )
+
+        if (config.plot_rounds and round_idx in config.plot_rounds) or is_attack_round:
             logger.info("[Plotting] Reconstruction steps at round %s", round_idx + 1)
             plot_iterations = min(max(config.plot_steps), config.attack_plot_iterations)
             plot_steps = [step for step in config.plot_steps if step <= plot_iterations]
@@ -1281,20 +1367,26 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
 
             for cls, samples in class_samples.items():
                 plot_samples = samples.clone()
+                plot_lejepa_aug = (
+                    identity_view_augmenter if disable_augmentations else lejepa_augmenter
+                )
+                plot_mae_aug = (
+                    identity_mae_augmenter if disable_augmentations else mae_augmenter
+                )
                 if config.attack_on == "gradients":
                     lejepa_signal = compute_gradients_for_data(
                         lejepa_server.global_model,
                         samples,
                         model_type="lejepa",
                         num_views=config.num_views,
-                        augmenter=lejepa_augmenter,
+                        augmenter=plot_lejepa_aug,
                     )
                     mae_signal = compute_gradients_for_data(
                         mae_server.global_model,
                         samples,
                         model_type="mae",
                         num_views=1,
-                        augmenter=mae_augmenter,
+                        augmenter=plot_mae_aug,
                     )
                 else:
                     lejepa_signal = lejepa_attacker._compute_update_vector(
@@ -1365,33 +1457,34 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 denormalize=not config.attack_use_raw_data,
             )
 
-            logger.info("[Plotting] t-SNE embeddings for validation samples")
-            if val_dataset is None:
-                val_dataset = datasets.MNIST(
-                    root="data", train=False, download=True, transform=mnist_transform
+            if config.plot_rounds and round_idx in config.plot_rounds:
+                logger.info("[Plotting] t-SNE embeddings for validation samples")
+                if val_dataset is None:
+                    val_dataset = datasets.MNIST(
+                        root="data", train=False, download=True, transform=mnist_transform
+                    )
+                val_data, val_labels = sample_mnist_dataset(
+                    val_dataset, max_samples=config.val_tsne_samples
                 )
-            val_data, val_labels = sample_mnist_dataset(
-                val_dataset, max_samples=config.val_tsne_samples
-            )
-            val_data_norm = normalize_mnist(val_data, config.normalize_mean, config.normalize_std)
-            plot_tsne_for_validation(
-                lejepa_server.global_model,
-                val_data_norm,
-                val_labels,
-                model_type="lejepa",
-                save_path=str(output_dir / f"lejepa_tsne_round{round_idx + 1}_val.png"),
-                title=f"LeJEPA Validation t-SNE (Round {round_idx + 1})",
-                image_shape=config.image_shape,
-            )
-            plot_tsne_for_validation(
-                mae_server.global_model,
-                val_data_norm,
-                val_labels,
-                model_type="mae",
-                save_path=str(output_dir / f"mae_tsne_round{round_idx + 1}_val.png"),
-                title=f"MAE Validation t-SNE (Round {round_idx + 1})",
-                image_shape=config.image_shape,
-            )
+                val_data_norm = normalize_mnist(val_data, config.normalize_mean, config.normalize_std)
+                plot_tsne_for_validation(
+                    lejepa_server.global_model,
+                    val_data_norm,
+                    val_labels,
+                    model_type="lejepa",
+                    save_path=str(output_dir / f"lejepa_tsne_round{round_idx + 1}_val.png"),
+                    title=f"LeJEPA Validation t-SNE (Round {round_idx + 1})",
+                    image_shape=config.image_shape,
+                )
+                plot_tsne_for_validation(
+                    mae_server.global_model,
+                    val_data_norm,
+                    val_labels,
+                    model_type="mae",
+                    save_path=str(output_dir / f"mae_tsne_round{round_idx + 1}_val.png"),
+                    title=f"MAE Validation t-SNE (Round {round_idx + 1})",
+                    image_shape=config.image_shape,
+                )
 
         if config.plot_rounds and round_idx in config.plot_rounds:
             logger.info("[Probing] Linear probe at round %s", round_idx + 1)

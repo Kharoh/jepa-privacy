@@ -843,6 +843,47 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         **mae_aug_kwargs,
     )
 
+    attack_round_mask_kwargs = {
+        "mask_ratio": config.attack_round_mask_ratio,
+        "noise_std": 0.0,
+        "rotation_deg": 0.0,
+        "translation_px": 0,
+        "scale_range": (1.0, 1.0),
+        "contrast_range": (1.0, 1.0),
+        "brightness_range": (1.0, 1.0),
+        "blur_prob": 0.0,
+        "perspective_prob": 0.0,
+        "solarize_prob": 0.0,
+        "solarize_threshold": 0,
+        "mask_mode": "pixel",
+        "patch_size": config.augmenter_kwargs.get("patch_size", 4),
+    }
+    attack_round_mae_mask_kwargs = {
+        **attack_round_mask_kwargs,
+        "mask_ratio": config.attack_round_mae_mask_ratio,
+    }
+
+    attack_round_view_augmenter = ViewAugmenter(
+        num_views=config.num_views,
+        image_shape=config.image_shape,
+        device=device,
+        normalize_mean=config.normalize_mean,
+        normalize_std=config.normalize_std,
+        deterministic=config.attack_deterministic_augment,
+        base_seed=config.attack_seed,
+        **attack_round_mask_kwargs,
+    )
+    attack_round_mae_augmenter = ViewAugmenter(
+        num_views=1,
+        image_shape=config.image_shape,
+        device=device,
+        normalize_mean=config.normalize_mean,
+        normalize_std=config.normalize_std,
+        deterministic=config.attack_deterministic_augment,
+        base_seed=config.attack_seed,
+        **attack_round_mae_mask_kwargs,
+    )
+
     lejepa_clients = [
         FederatedClient(
             i,
@@ -949,6 +990,15 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
         disable_augmentations = bool(
             is_attack_round and config.attack_round_disable_augmentations
         )
+        if is_attack_round and disable_augmentations:
+            round_lejepa_augmenter = attack_round_view_augmenter
+            round_mae_augmenter = attack_round_mae_augmenter
+        elif disable_augmentations:
+            round_lejepa_augmenter = identity_view_augmenter
+            round_mae_augmenter = identity_mae_augmenter
+        else:
+            round_lejepa_augmenter = None
+            round_mae_augmenter = None
         attack_num_layers = config.attack_round_num_layers if is_attack_round else None
         attack_tv_weight = config.attack_round_tv_weight if is_attack_round else None
         attack_iterations = (
@@ -990,7 +1040,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
                 use_amp=config.use_amp,
-                augmenter_override=identity_view_augmenter if disable_augmentations else None,
+                augmenter_override=round_lejepa_augmenter,
             )
         lejepa_updates = list(lejepa_updates_by_client.values())
         lejepa_server.aggregate(
@@ -1036,7 +1086,7 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
                 num_workers=config.data_loader_num_workers,
                 pin_memory=pin_memory,
                 use_amp=config.use_amp,
-                augmenter_override=identity_mae_augmenter if disable_augmentations else None,
+                augmenter_override=round_mae_augmenter,
             )
         mae_updates = list(mae_updates_by_client.values())
         mae_server.aggregate(
@@ -1139,7 +1189,13 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             ):
                 if disable_augmentations:
                     attacker_augmenter = (
-                        identity_view_augmenter if model_key == "lejepa" else identity_mae_augmenter
+                        attack_round_view_augmenter
+                        if model_key == "lejepa" and is_attack_round
+                        else attack_round_mae_augmenter
+                        if model_key == "mae" and is_attack_round
+                        else identity_view_augmenter
+                        if model_key == "lejepa"
+                        else identity_mae_augmenter
                     )
                 else:
                     attacker_augmenter = (
@@ -1327,10 +1383,18 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             for cls, samples in class_samples.items():
                 plot_samples = samples.clone()
                 plot_lejepa_aug = (
-                    identity_view_augmenter if disable_augmentations else lejepa_augmenter
+                    attack_round_view_augmenter
+                    if is_attack_round and disable_augmentations
+                    else identity_view_augmenter
+                    if disable_augmentations
+                    else lejepa_augmenter
                 )
                 plot_mae_aug = (
-                    identity_mae_augmenter if disable_augmentations else mae_augmenter
+                    attack_round_mae_augmenter
+                    if is_attack_round and disable_augmentations
+                    else identity_mae_augmenter
+                    if disable_augmentations
+                    else mae_augmenter
                 )
                 for model_key, model, attacker, augmenter in (
                     ("lejepa", lejepa_server.global_model, lejepa_attacker, plot_lejepa_aug),
@@ -1443,10 +1507,18 @@ def run_federated_privacy_experiment(config: ExperimentConfig, output_dir: Path,
             for cls, samples in class_samples.items():
                 plot_samples = samples.clone()
                 plot_lejepa_aug = (
-                    identity_view_augmenter if disable_augmentations else lejepa_augmenter
+                    attack_round_view_augmenter
+                    if is_attack_round and disable_augmentations
+                    else identity_view_augmenter
+                    if disable_augmentations
+                    else lejepa_augmenter
                 )
                 plot_mae_aug = (
-                    identity_mae_augmenter if disable_augmentations else mae_augmenter
+                    attack_round_mae_augmenter
+                    if is_attack_round and disable_augmentations
+                    else identity_mae_augmenter
+                    if disable_augmentations
+                    else mae_augmenter
                 )
                 if config.attack_on == "gradients":
                     lejepa_signal = compute_gradients_for_data(

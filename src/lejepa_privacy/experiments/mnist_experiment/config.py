@@ -114,6 +114,8 @@ class ExperimentConfig:
     attack_round_max_batches: int | None = 1
     attack_round_clients: int = 1
     attack_round_disable_augmentations: bool = True
+    attack_round_mask_ratio: float = 0.4
+    attack_round_mae_mask_ratio: float = 0.2
     attack_round_num_layers: int | None = None
     attack_round_tv_weight: float | None = None
     attack_round_iterations: int | None = None

@@ -86,6 +86,8 @@
   "attack_round_max_batches": 1,
   "attack_round_clients": 1,
   "attack_round_disable_augmentations": true,
+  "attack_round_mask_ratio": 0.4,
+  "attack_round_mae_mask_ratio": 0.4,
   "attack_round_num_layers": null,
   "attack_round_tv_weight": null,
   "attack_round_iterations": null,

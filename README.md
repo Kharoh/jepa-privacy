@@ -1,16 +1,13 @@
 # LeJEPA vs MAE Federated Privacy (ImageNette + MNIST)
 
-This experiment compares LeJEPA and MAE on the ImageNette (inet10) dataset using ViT backbones
-in a federated learning setup. It mirrors the original MNIST privacy pipeline by running
-gradient inversion attacks during training and reporting privacy metrics plus online probe
-accuracy for both models.
+This experiment compares LeJEPA and MAE on the MNIST dataset using ViT backbones in a federated learning setup. It runs gradient inversion attacks during training and reporting privacy metrics plus online probe accuracy for both models.
 
 The MNIST pipeline is the reference implementation for privacy analysis and includes
 update-based inversion (FedAvg-style), aligned augmentations, per-round utility metrics, and
 communication/time tracking.
 
 ## What’s inside
-- ImageNette dataset loading via Hugging Face Datasets
+- MNIST dataset loading
 - Federated learning with non-IID client splits (Dirichlet)
 - LeJEPA with SIGReg + invariance loss on a ViT-S/8 backbone
 - MAE with a ViT-S/8 encoder and lightweight decoder for patch reconstruction
@@ -21,9 +18,6 @@ communication/time tracking.
 1. Install dependencies from `requirements.txt`.
 2. Run the script you want:
 	- MNIST (with JSON config): `scripts/run_mnist.py --config configs/mnist.json`
-	- ImageNette: `scripts/run_imagenette.py`
-
-The script downloads ImageNette automatically on first run.
 
 ## MNIST experiment protocol (summary)
 - **Federated mode:** FedAvg with model update sharing by default; set `federated_strategy` to `gradients` to use averaged gradients (FedSGD-style).
@@ -49,7 +43,6 @@ MNIST results are written under `results/mnist_<timestamp>/` (configurable). Exa
 ## Project layout
 - `src/lejepa_privacy/experiments/mnist_experiment/`: MNIST pipeline modules (data/models/training/privacy/utils).
 - `src/lejepa_privacy/experiments/mnist.py`: MNIST entrypoint.
-- `src/lejepa_privacy/experiments/imagenette.py`: ImageNette pipeline (refactored).
 - `scripts/`: convenience entrypoints.
 
 ## Notes
